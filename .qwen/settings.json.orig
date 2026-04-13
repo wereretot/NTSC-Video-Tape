@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//mnt/MassArchive/Programs/Tape Warping/CapstanVar/doc/**)"
-    ]
-  }
-}
