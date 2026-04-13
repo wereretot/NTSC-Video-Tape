@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/MassArchive/Programs/Tape Warping/CapstanVar/doc/**)",
+      "Read(//mnt/MassArchive/Programs/Tape Warping/CapstanVar/**)",
+      "Bash(nm *)",
+      "Bash(pkg-config *)",
+      "Bash(find *)",
+      "Bash(xxd *)",
+      "Bash(cmake *)",
+      "Bash(file *)",
+      "Bash(ninja)"
+    ]
+  },
+  "$version": 3
+}
