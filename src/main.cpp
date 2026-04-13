@@ -48,6 +48,14 @@
 #include "dsp_types.hpp"
 #undef _CMATH_
 
+// Forward decl
+struct AppState;
+// Forward decl
+struct AppState;
+void startGlobalAudioCapture(AppState& app, const std::string& path);
+void stopGlobalAudioCapture(AppState& app);
+void writeWavHeader(FILE* f, uint32_t total_frames);
+
 // ── SDL2 ────────────────────────────────────────────────────
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_audio.h>
@@ -98,7 +106,7 @@ extern "C" {
 static constexpr int   FW            = 640;
 static constexpr int   FH            = 480;
 static constexpr float ASPECT        = float(FW)/float(FH);
-static constexpr int   Q_DEPTH       = 6;
+static constexpr int   Q_DEPTH       = 60;
 static constexpr int   AUDIO_SR     = 44100;
 static const     float kPI           = 3.14159265f;
 // NTSC subcarrier: 227.5 cycles per active line at W pixels
@@ -800,6 +808,10 @@ struct ExportContext {
     int               frameCount = 0;
     std::string       tempVideoPath;
     std::string       tempAudioPath;
+    std::mutex        writerMu;
+    FILE*             audioFp = nullptr;
+    uint32_t          audioFramesWritten = 0;
+    std::atomic<bool> isClosing{false};
 };
 
 struct ProcessParams {
@@ -850,27 +862,22 @@ private:
                 if(last_raw.empty()) continue;
                 raw = last_raw;
             } else {
-                last_raw = raw;
                 if(raw.empty()) continue;
-            }
-            // ── Crop to 4:3 (center-crop) ─────────────────────────────────
-            {
+                
+                // ── Crop to 4:3 (center-crop) PRE-RESIZE ──────────────────────
                 int sw = raw.cols, sh = raw.rows;
                 float srcAR = float(sw) / float(sh);
                 constexpr float kAR43 = 4.f / 3.f;
-                if (std::abs(srcAR - kAR43) > 0.01f) {
+                if (std::abs(srcAR - kAR43) > 0.02f) {
                     int cw, ch;
-                    if (srcAR > kAR43) { // wider — crop sides
-                        ch = sh;
-                        cw = int(sh * kAR43);
-                    } else {             // taller — crop top/bottom
-                        cw = sw;
-                        ch = int(sw / kAR43);
-                    }
-                    int ox = (sw - cw) / 2;
-                    int oy = (sh - ch) / 2;
+                    if (srcAR > kAR43) { ch = sh; cw = int(sh * kAR43); }
+                    else { cw = sw; ch = int(sw / kAR43); }
+                    int ox = std::clamp((sw - cw) / 2, 0, sw-1);
+                    int oy = std::clamp((sh - ch) / 2, 0, sh-1);
+                    cw = std::clamp(cw, 1, sw-ox); ch = std::clamp(ch, 1, sh-oy);
                     raw = raw(cv::Rect(ox, oy, cw, ch)).clone();
                 }
+                last_raw = raw;
             }
             Effects::Params fx; bool ntscOn; EngineParams ep{}; VideoParams vp{}; float spd=1.f; float iSpd=1.f;
             bool hasEng=false; int si=0;
@@ -887,11 +894,8 @@ private:
                 else ntsc_.process(eff,proc,frameNum_,ep,vp,spd,iSpd);}
             else proc=eff;
             
-            // ── EXPORT ENGINE ──────────────────────────────────────────
-            if (pp.exPtr && pp.exPtr->active && pp.exPtr->writer.isOpened()) {
-                pp.exPtr->writer.write(proc);
-                pp.exPtr->frameCount++;
-            }
+            // Recording hook removed - now handled asynchronously in recordThread
+
 
             outQ.push(std::move(proc));++frameNum_;++fpsCount;
             auto now=std::chrono::steady_clock::now();float dt=std::chrono::duration<float>(now-tPrev).count();
@@ -936,13 +940,14 @@ private:
                 cap.release();
                 if(src==SourceType::Camera){
                     cap.open(0);
-                    if(!cap.isOpened()){sourceType=SourceType::Demo;src=SourceType::Demo;}
-                    else{cap.set(cv::CAP_PROP_FRAME_WIDTH,FW);cap.set(cv::CAP_PROP_FRAME_HEIGHT,FH);
-                         srcFPS=cap.get(cv::CAP_PROP_FPS);if(srcFPS<=0)srcFPS=kNTSC_FPS;}
+                    if(!cap.isOpened()){ sourceType.store(SourceType::Demo); src=SourceType::Demo; }
+                    else {
+                         srcFPS=cap.get(cv::CAP_PROP_FPS); if(srcFPS<=0)srcFPS=kNTSC_FPS;
+                         g_sourceFPS.store(float(srcFPS)); g_videoReset.store(true);
+                    }
                 }else if(src==SourceType::File&&!fp.empty()){
-                    // Extract audio BEFORE opening the video device to avoid locking
                     std::string wav=extractAudioToWav(fp);
-                    if(!running_.load()) return; // App shutting down
+                    if(!running_.load()) return;
                     
                     cap.open(fp);
                     if(!cap.isOpened()){
@@ -950,11 +955,10 @@ private:
                         sourceType.store(SourceType::Demo); src=SourceType::Demo;
                     } else {
                          if(!running_.load()) return;
-                         // ONLY NOW start the audio engine, after the video device is definitely locked and ready
                          if(!wav.empty()&&onAudioFileReady) onAudioFileReady(wav);
                          
-                         srcFPS=cap.get(cv::CAP_PROP_FPS);if(srcFPS<=0)srcFPS=kNTSC_FPS;
-                         g_sourceFPS.store(float(srcFPS));g_videoReset.store(true);
+                         srcFPS=cap.get(cv::CAP_PROP_FPS); if(srcFPS<=0)srcFPS=kNTSC_FPS;
+                         g_sourceFPS.store(float(srcFPS)); g_videoReset.store(true);
                     }
                 }
                 lastSrc=src;lastFile=fp;wallClock=std::chrono::steady_clock::now();}
@@ -992,9 +996,6 @@ private:
     }
 };
 
-// ============================================================
-//  §9  SDL Texture wrapper
-// ============================================================
 struct SDLTexture{
     SDL_Texture*tex=nullptr;int w=0,h=0;
     void create(SDL_Renderer*r,int W,int H){
@@ -1006,13 +1007,26 @@ struct SDLTexture{
         void*px;int pitch;SDL_LockTexture(tex,nullptr,&px,&pitch);
         for(int y=0;y<h;++y)memcpy((uchar*)px+y*pitch,rs.ptr(y),w*3);
         SDL_UnlockTexture(tex);}
+    void drawLetterbox(SDL_Renderer* renderer, int x, int y, int w, int h, float targetAR) {
+        float windowAR = float(w)/float(h);
+        int rw, rh, rx, ry;
+        if(windowAR > targetAR){
+            rh = h; rw = int(h * targetAR);
+            rx = x + (w - rw)/2; ry = y;
+        } else {
+            rw = w; rh = int(w / targetAR);
+            rx = x; ry = y + (h - rh)/2;
+        }
+        SDL_Rect dst = {rx, ry, rw, rh};
+        SDL_RenderCopy(renderer, tex, nullptr, &dst);
+    }
     ~SDLTexture(){if(tex)SDL_DestroyTexture(tex);}
 };
 
 // ============================================================
 //  §10  AppState
 // ============================================================
-struct AppState{
+struct AppState {
     CaptureThread      capture;
     ProcessingPipeline pipeline;
     ProcessParams      pp;
@@ -1024,19 +1038,65 @@ struct AppState{
     std::mutex         audioMu; // Protects tapeEngine and audioIO
     std::unique_ptr<TapeEngine> tapeEngine;
     std::unique_ptr<AudioIO>    audioIO;
-    std::string        audioWavPath;
+    std::string        audioWavPath; // Legacy/Active file path
     ExportContext      exportCtx;
+    FrameQueue<std::vector<float>> audioCaptureQ;
+    FrameQueue<cv::Mat> recordQ;
+    
     int   selectedFx=0,tapeSpeedIdx=0;
     bool  ntscEnabled=true;
     float vuL=0.f,vuR=0.f;
     uint64_t startMs=SDL_GetTicks64();
     VideoParams videoParams;
-    EngineParams baseParams; // UI state
-
+    EngineParams baseParams;
+    
     void setParam(std::function<void(EngineParams&)> fn){
         fn(baseParams);
     }
 };
+
+void startGlobalAudioCapture(AppState& app, const std::string& path) {
+    std::lock_guard<std::mutex> lk(app.exportCtx.writerMu);
+    app.exportCtx.audioFp = std::fopen(path.c_str(), "wb");
+    if(app.exportCtx.audioFp) {
+        app.exportCtx.audioFramesWritten = 0;
+        app.exportCtx.isClosing = false;
+        writeWavHeader(app.exportCtx.audioFp, 0);
+    }
+}
+void stopGlobalAudioCapture(AppState& app) {
+    std::lock_guard<std::mutex> lk(app.exportCtx.writerMu);
+    if(app.exportCtx.audioFp) {
+        std::fseek(app.exportCtx.audioFp, 0, SEEK_SET);
+        writeWavHeader(app.exportCtx.audioFp, app.exportCtx.audioFramesWritten);
+        std::fclose(app.exportCtx.audioFp);
+        app.exportCtx.audioFp = nullptr;
+    }
+}
+void writeWavHeader(FILE* f, uint32_t total_frames) {
+    uint32_t data_size = total_frames * 2 * sizeof(int16_t); 
+    uint32_t chunk_size = 36 + data_size;
+    std::fwrite("RIFF", 1, 4, f);
+    std::fwrite(&chunk_size, 4, 1, f);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    uint32_t subchunk1_size = 16;
+    uint16_t audio_format = 1; // PCM
+    uint16_t num_channels = 2;
+    uint32_t sample_rate = SR;
+    uint32_t byte_rate = sample_rate * num_channels * 2;
+    uint16_t block_align = num_channels * 2;
+    uint16_t bits_per_sample = 16;
+    std::fwrite(&subchunk1_size, 4, 1, f);
+    std::fwrite(&audio_format, 2, 1, f);
+    std::fwrite(&num_channels, 2, 1, f);
+    std::fwrite(&sample_rate, 4, 1, f);
+    std::fwrite(&byte_rate, 4, 1, f);
+    std::fwrite(&block_align, 2, 1, f);
+    std::fwrite(&bits_per_sample, 2, 1, f);
+    std::fwrite("data", 1, 4, f);
+    std::fwrite(&data_size, 4, 1, f);
+}
+
 
 // ============================================================
 //  §11  80s Broadcast-Centre UI
@@ -1394,9 +1454,9 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     {std::lock_guard<std::mutex> lk(app.pp.mu);app.pp.ntscEnabled=app.ntscEnabled;}
     ImGui::Text("TAPE SPEED:"); ImGui::SameLine();
     bool spCh=false;
-    if(ImGui::RadioButton("SP",&app.tapeSpeedIdx,0))spCh=true; ImGui::SameLine();
-    if(ImGui::RadioButton("LP",&app.tapeSpeedIdx,1))spCh=true; ImGui::SameLine();
-    if(ImGui::RadioButton("EP",&app.tapeSpeedIdx,2))spCh=true;
+    if(ImGui::RadioButton("SP",&app.tapeSpeedIdx,0)) spCh=true; ImGui::SameLine();
+    if(ImGui::RadioButton("LP",&app.tapeSpeedIdx,1)) spCh=true; ImGui::SameLine();
+    if(ImGui::RadioButton("EP",&app.tapeSpeedIdx,2)) spCh=true;
     if(spCh){
         // Auto-set IPS from tape speed preset (SP=15, LP=7.5, EP=3.75)
         static const float kIPS[] = {15.f, 7.5f, 3.75f};
@@ -1474,23 +1534,24 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     if (!app.exportCtx.active) {
         if (ImGui::Button("START RECORDING TO DISK", {colW-18, 0})) {
             app.exportCtx.format = (ExportFormat)fmtIdx;
-            std::string ext = (fmtIdx == 0) ? ".mp4" : (fmtIdx == 1 ? ".mkv" : ".avi");
-            app.exportCtx.tempVideoPath = "temp_render" + ext;
-            app.exportCtx.tempAudioPath = "temp_audio_proc.wav";
+            std::string runId = std::to_string(SDL_GetTicks());
+            app.exportCtx.tempVideoPath = "temp_v_" + runId + ".avi";
+            app.exportCtx.tempAudioPath = "temp_a_" + runId + ".wav";
             
-            int fourcc;
-            if (fmtIdx == 0) fourcc = cv::VideoWriter::fourcc('a','v','c', '1');
-            else fourcc = cv::VideoWriter::fourcc('F','F','V','1');
+            // MJPG is the fastest real-time encoder available in OpenCV/FFmpeg
+            int fourcc = cv::VideoWriter::fourcc('M','J','P','G'); 
             
-            if (app.exportCtx.writer.open(app.exportCtx.tempVideoPath, fourcc, kNTSC_FPS, {FW, FH})) {
-                app.exportCtx.active = true;
+            {
+                std::lock_guard<std::mutex> wlk(app.exportCtx.writerMu);
+                if (app.exportCtx.writer.open(app.exportCtx.tempVideoPath, fourcc, kNTSC_FPS, {FW, FH})) {
+                    app.exportCtx.active = true;
+                }
+            }
+            
+            if (app.exportCtx.active) {
                 app.exportCtx.frameCount = 0;
-                
-                // Start capturing processed audio!
-                std::lock_guard<std::mutex> a_lk(app.audioMu);
-                if (app.audioIO) app.audioIO->start_capture(app.exportCtx.tempAudioPath);
-                
-                SDL_Log("Export: Started recording to %s", app.exportCtx.tempVideoPath.c_str());
+                startGlobalAudioCapture(app, app.exportCtx.tempAudioPath);
+                SDL_Log("Export: Started recording intermediate to %s", app.exportCtx.tempVideoPath.c_str());
             } else {
                 SDL_Log("Export: Failed to open VideoWriter");
             }
@@ -1498,46 +1559,60 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     } else {
         ImGui::PushStyleColor(ImGuiCol_Button, {.8f, 0, 0, 1});
         if (ImGui::Button("STOP & FINISH EXPORT", {colW-18, 40})) {
-            app.exportCtx.active = false;
-            app.exportCtx.writer.release();
+            SDL_Log("Export: Stop button pressed");
+            app.exportCtx.isClosing = true;
             
-            // Stop audio capture
-            { std::lock_guard<std::mutex> a_lk(app.audioMu);
-              if (app.audioIO) app.audioIO->stop_capture(); }
+            // Wait for drain thread to finish
+            while(app.exportCtx.active) {
+                SDL_Delay(10);
+            }
             
+            SDL_Log("Export: Finalizing audio capture...");
+            stopGlobalAudioCapture(app);
+            
+            SDL_Log("Export: Releasing VideoWriter...");
+            {
+                std::lock_guard<std::mutex> wlk(app.exportCtx.writerMu);
+                app.exportCtx.writer.release();
+            }
+            
+            SDL_Log("Export: Finalizing filenames...");
             std::string outName = "render_export_" + std::to_string(SDL_GetTicks()) + 
                                   ((app.exportCtx.format == ExportFormat::H264_MP4) ? ".mp4" : 
                                    (app.exportCtx.format == ExportFormat::FFV1_MKV ? ".mkv" : ".avi"));
             
             char muxCmd[4096];
-            // Use the processed RAW audio now!
-            bool hasAudio = false;
+            bool hasAudio = false; long audioSz = 0;
+            SDL_Log("Export: Checking audio file %s", app.exportCtx.tempAudioPath.c_str());
             std::FILE* test = std::fopen(app.exportCtx.tempAudioPath.c_str(), "rb");
             if (test) {
                 std::fseek(test, 0, SEEK_END);
-                long sz = std::ftell(test);
+                audioSz = std::ftell(test);
                 std::fclose(test);
-                if (sz > 1024) hasAudio = true;
-                else SDL_Log("Export: Audio capture file too small (%ld bytes)", sz);
+                if (audioSz > 4096) hasAudio = true;
             }
             
+            SDL_Log("Export: Capture summary - Video frames: %d, Audio: %ld bytes", 
+                app.exportCtx.frameCount, audioSz);
+
             if (hasAudio) {
+                const char* aCodec = (app.exportCtx.format == ExportFormat::H264_MP4) ? "aac" : "copy";
                 std::snprintf(muxCmd, sizeof(muxCmd),
-                    "ffmpeg -y -i \"%s\" -i \"%s\" -c:v copy -c:a aac -b:a 192k -aspect 4:3 \"%s\"",
-                    app.exportCtx.tempVideoPath.c_str(), app.exportCtx.tempAudioPath.c_str(), outName.c_str());
+                    "ffmpeg -y -i \"%s\" -i \"%s\" -map 0:v:0 -map 1:a:0 -c:v copy -c:a %s -shortest -aspect 4:3 \"%s\"",
+                    app.exportCtx.tempVideoPath.c_str(), app.exportCtx.tempAudioPath.c_str(), aCodec, outName.c_str());
             } else {
                 std::snprintf(muxCmd, sizeof(muxCmd),
                     "ffmpeg -y -i \"%s\" -c:v copy -aspect 4:3 \"%s\"",
                     app.exportCtx.tempVideoPath.c_str(), outName.c_str());
             }
             
-            SDL_Log("Export: Muxing final output (with processed audio)...");
+            SDL_Log("Export: Running mux command: %s", muxCmd);
             if (std::system(muxCmd) == 0) {
                 SDL_Log("Export: SUCCESS -> %s", outName.c_str());
                 std::remove(app.exportCtx.tempVideoPath.c_str());
                 std::remove(app.exportCtx.tempAudioPath.c_str());
             } else {
-                SDL_Log("Export: Muxing error. Raw files preserved.");
+                SDL_Log("Export: FAILED (system call returned non-zero)");
             }
         }
         ImGui::PopStyleColor();
@@ -1600,6 +1675,11 @@ int main(int,char**){
         if(!aio->open()){ SDL_Log("AudioIO: Failed to open"); return; }
         aio->play_forward(); eng->is_playing.store(true);
         
+        // Set the global capture callback
+        aio->set_capture_callback([&app](const std::vector<float>& samples){
+            app.audioCaptureQ.push(samples);
+        });
+
         {
             std::lock_guard<std::mutex> lk(app.audioMu);
             // Safely stop and replace the current engine/IO
@@ -1630,10 +1710,75 @@ int main(int,char**){
 
     std::atomic<bool> drainRun{true};
     std::thread drainThread([&]{
+        cv::Mat out;
         while(drainRun){
-            cv::Mat f; if(app.pipeline.outQ.pop(f,20)){
-                std::lock_guard<std::mutex> lk(app.frameMu);
-                app.lastOut=std::move(f);}}});
+            if(app.pipeline.outQ.pop(out, 10)){
+                if (app.exportCtx.active && !app.exportCtx.isClosing) {
+                    app.recordQ.push(out.clone()); // Clone for the recorder
+                }
+                {
+                    std::lock_guard<std::mutex> lk(app.frameMu);
+                    app.lastOut = out; // Transfer ownership to UI (no clone!)
+                }
+            }
+        }
+    });
+
+    std::atomic<bool> recordRun{true};
+    std::thread recordThread([&]{
+        cv::Mat f;
+        std::vector<float> residue;
+        while(recordRun){
+            if(app.recordQ.pop(f, 20)){
+                std::lock_guard<std::mutex> wlk(app.exportCtx.writerMu);
+                if (app.exportCtx.writer.isOpened()) {
+                    // 1. Write Video
+                    app.exportCtx.writer.write(f);
+                    app.exportCtx.frameCount++;
+                    
+                    // 2. Write Audio (Synced)
+                    if (app.exportCtx.audioFp) {
+                        double totalExpected = (double)app.exportCtx.frameCount * (SR / kNTSC_FPS);
+                        int toWriteTotal = (int)totalExpected - (int)app.exportCtx.audioFramesWritten;
+                        
+                        if (toWriteTotal > 0) {
+                            std::vector<int16_t> pcm; pcm.reserve(toWriteTotal * 2);
+                            int fromRes = std::min((int)residue.size()/2, toWriteTotal);
+                            for(int i=0; i<fromRes*2; ++i) {
+                                float s = residue[i];
+                                if(s>1.f) s=1.f; if(s<-1.f) s=-1.f;
+                                pcm.push_back((int16_t)(s * 32767.f));
+                            }
+                            residue.erase(residue.begin(), residue.begin() + fromRes*2);
+                            int remaining = toWriteTotal - fromRes;
+                            std::vector<float> block;
+                            while(remaining > 0 && app.audioCaptureQ.try_pop(block)) {
+                                int fromBlock = std::min((int)block.size()/2, remaining);
+                                for(int i=0; i<fromBlock*2; ++i) {
+                                    float s = block[i];
+                                    if(s>1.f) s=1.f; if(s<-1.f) s=-1.f;
+                                    pcm.push_back((int16_t)(s * 32767.f));
+                                }
+                                if(fromBlock * 2 < (int)block.size()) {
+                                    residue.insert(residue.end(), block.begin() + fromBlock*2, block.end());
+                                }
+                                remaining -= fromBlock;
+                            }
+                            if(remaining > 0) {
+                                for(int i=0; i<remaining*2; ++i) pcm.push_back(0);
+                            }
+                            std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), app.exportCtx.audioFp);
+                            app.exportCtx.audioFramesWritten += toWriteTotal;
+                            if(residue.size() > 44100*2) residue.clear();
+                        }
+                    }
+                }
+            } else if (app.exportCtx.isClosing && app.recordQ.size() == 0) {
+                // Signal finish back to UI
+                app.exportCtx.active = false;
+            }
+        }
+    });
 
     bool running=true; SDL_Event evt;
     auto lastPoll=std::chrono::steady_clock::now();
