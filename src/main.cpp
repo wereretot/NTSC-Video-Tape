@@ -219,6 +219,10 @@ private:
     std::deque<T> q_; size_t cap_;
 };
 
+// Global real-time wall clock for NTSC oscillators — NOT tied to frame rate.
+// Declared here so NTSCSimulator::process() can see it.
+static std::atomic<double>  g_wallTimeSec{0.0};
+
 // NTSC Constants
 static constexpr float kSC_FREQ = 227.5f; // Cycles per line
 
@@ -246,35 +250,38 @@ public:
         kSC_PX = (2.0f * kPI * kSC_FREQ) / (float)W_;
     }
 
-    void process(const cv::Mat& in, cv::Mat& out, int frameNum, const EngineParams& ep, const VideoParams& vp, float tapeSpd, float instantSpd) {
+    void process(const cv::Mat& in, cv::Mat& out, int frameNum, const EngineParams& ep, const VideoParams& vp, float tapeSpd, float instantSpd, float wallDt) {
         const int W = in.cols, H = in.rows;
+        if (W == 0 || H == 0) { SDL_Log("[NTSC] CRASH GUARD: empty input frame %d", frameNum); return; }
         if (W != W_) initBuffers(W, H);
 
-        const float spd = std::clamp(tapeSpd, 0.1f, 4.0f);
-        wallTime_ += kNTSC_FRAME_S;
-        // tapeTime_ is now passed as a parameter or managed externally 
-        // to maintain absolute sync with the audio engine's play_head.
-        
-        const float fPhase = float(frameNum % 4) * kPI * 0.5f;
+        // Read absolute wall-clock time directly. All oscillators are computed
+        // from this value — NOTHING is accumulated per frame, so tape speed
+        // and pipeline frame rate cannot affect effect timing.
+        wallTime_ = (float)g_wallTimeSec.load();
+
+        // Field phase: NTSC fields at 59.94 Hz
+        const float fPhase = std::fmod(wallTime_ * (kNTSC_FPS * 2.f), 4.f) * (kPI * 0.5f);
 
         // --- V-SYNC LOSS (Rolling) & TAPE SPEED ERROR ---
         float speed_error = std::abs(1.0f - instantSpd);
-        float target_error = speed_error + vp.tracking_error; // Uses VideoParams
+        float target_error = speed_error + vp.tracking_error;
         if (target_error > 2.0f) target_error = 2.0f;
-        tracking_error_lpf_ += (target_error - tracking_error_lpf_) * 0.1f;
 
+        // Low-pass filter on tracking error (per-frame → use absolute wall-clock)
+        float dt = wallDt;
+        float lpfA = 1.f - std::exp(-dt * 3.f);  // 3 Hz cutoff → real seconds
+        tracking_error_lpf_ += (target_error - tracking_error_lpf_) * lpfA;
+
+        // V-roll: absolute position from wall-clock
         if (target_error > 0.01f || vp.sync_hold_failure > 0.0f) {
-            // Significant speed deviation causes vertical roll (V-Sync loss)
-            // Increased from 120 to 450 for much more aggressive rolling
-            float roll_speed = (target_error * 450.0f) + (vp.sync_hold_failure * 600.0f);
-            v_roll_accum_ += roll_speed; 
+            float roll_hz = (target_error * 7.5f) + (vp.sync_hold_failure * 10.f);
+            v_roll_accum_ = std::sin(wallTime_ * roll_hz * kPI * 2.f) * (target_error * 480.f + vp.sync_hold_failure * 600.f);
         } else {
-            // "Gravity" to snap back to center slowly if not rolling
-            v_roll_accum_ *= 0.7f;
+            v_roll_accum_ *= std::exp(-dt * 10.f);
             if (std::abs(v_roll_accum_) < 1.0f) v_roll_accum_ = 0.0f;
         }
-        
-        // Add vertical jitter (frame jump) when unstable
+
         float v_jitter = 0.0f;
         if (target_error > 0.1f) {
             std::mt19937 jRng(uint32_t(frameNum) * 999u);
@@ -284,43 +291,69 @@ public:
         int v_roll = (int(v_roll_accum_ + v_jitter)) % H;
         if (v_roll < 0) v_roll += H;
 
-        // --- TRACKING ENVELOPE (Noise Bar Drift) ---
-        noise_bar_phase_ += target_error * 0.25f;
-        if (noise_bar_phase_ > 1.0f) noise_bar_phase_ -= 1.0f;
+        // --- TRACKING ENVELOPE (Noise Bar Drift) — absolute phase ---
+        // Real VHS tracking errors create a moving noise bar that scrolls
+        // vertically. The bar moves at 0.5-8 Hz depending on tracking error.
+        float noise_bar_rate = target_error * 0.8f * kNTSC_FPS;  // Faster than before
+        noise_bar_phase_ = std::fmod(wallTime_ * noise_bar_rate, 1.0f);
+        if (noise_bar_phase_ < 0.0f) noise_bar_phase_ += 1.0f;
         float bar_y = noise_bar_phase_ * float(H);
-        float bar_width = 30.0f + tracking_error_lpf_ * 100.0f;
+        float bar_width = 20.0f + tracking_error_lpf_ * 80.0f;
 
-        // --- Massive True H-SYNC Roll ---
-        // Reduced frequency error for H-sync (from 15 to 5) to allow V-roll to dominate the visual
-        float h_freq_err = (target_error * 5.0f) + (vp.sync_hold_failure * 40.0f);
-        h_roll_phase_ -= h_freq_err * kNTSC_FRAME_S; 
-        if (h_roll_phase_ < 0.0f) h_roll_phase_ += 1.0f;
-        
-        // Organic AFC Snap-back when fast/locked
-        if (h_freq_err < 0.01f && h_roll_phase_ != 0.0f) {
-            float dist = h_roll_phase_;
-            if (dist > 0.5f) dist -= 1.0f; 
-            dist *= 0.8f; 
-            if (std::abs(dist) < 0.001f) h_roll_phase_ = 0.0f;
-            else h_roll_phase_ = dist > 0.0f ? dist : 1.0f + dist;
+        // --- H-SYNC Roll — absolute phase ---
+        // Real VHS H-sync errors are FAST: the horizontal oscillator
+        // in a CRT TV runs at 15,734 Hz and any deviation from the
+        // broadcast signal causes immediate phase drift. When tape
+        // speed is wrong, H-sync rolls at 2-15 Hz depending on error.
+        float h_freq_err = (target_error * 12.0f) + (vp.sync_hold_failure * 60.0f);
+        if (h_freq_err > 0.01f) {
+            h_roll_phase_ = std::fmod(h_roll_phase_ - wallDt * h_freq_err, 1.0f);
+            if (h_roll_phase_ < 0.0f) h_roll_phase_ += 1.0f;
+        } else {
+            // Decay H-roll phase to zero when signal is clean
+            h_roll_phase_ *= std::exp(-wallDt * 8.0f);
+            if (std::abs(h_roll_phase_) < 0.001f) h_roll_phase_ = 0.0f;
         }
 
         // --- TAPE-DRIVEN MECHANICAL MODEL ---
-        // The "Warp" now comes directly from the simulated tape speed errors
-        float speed_dev = (instantSpd - tapeSpd) / tapeSpd;
-        
-        // WOW: Low-frequency drift from the motor/transport
-        mechanical_wow_ = speed_dev * 150.0f;
-        
-        // AFC Flagging: High-energy sync jump at the top of the frame
-        // This is the error in the TV's H-PLL as it struggles with speed variations.
-        afc_error_ = mechanical_wow_ * 0.8f + (speed_dev * 500.0f);
+        // Real VHS horizontal warping is characterized by FAST, chaotic
+        // micro-transients (tape tension spikes, guide roller bounce,
+        // head drum eccentricity) superimposed on slower "wow" drift.
+        // Guard against div-by-zero during engine spinup
+        float safeTapeSpd = std::max(tapeSpd, 0.001f);
+        float speed_dev = std::abs(instantSpd - safeTapeSpd) / safeTapeSpd;
+
+        // Fast timebase error: high-frequency jitter from tape scraping
+        // past heads. Realistic VHS TBE is 1-15 pixels peak-to-peak
+        // under tracking error, with impulsive spikes up to 40 px.
+        float fast_tbe = speed_dev * 18.0f;
+
+        // Slow "wow" drift: large-scale tape tension variations (0.1–2 Hz)
+        // Amplitude: 5-30 pixels depending on tape condition
+        mechanical_wow_ = speed_dev * 120.0f;
+
+        // Tape tension impulse spikes: sudden "snap" events when tape
+        // slips or catches on guide pins. Modeled as stochastic impulses.
+        float tape_tension_impulse = 0.0f;
+        {
+            // Impulse rate scales with speed error (faster = more spikes)
+            float impulse_rate = speed_dev * 4.0f + 0.5f;  // 0.5-4 Hz
+            float impulse_phase = std::fmod(tapeTime_ * impulse_rate, 1.0f);
+            // Sharp attack, slow decay (real tape tension behavior)
+            if (impulse_phase < 0.05f) {
+                tape_tension_impulse = (impulse_phase / 0.05f) * speed_dev * 35.0f;
+            } else {
+                tape_tension_impulse = std::exp(-(impulse_phase - 0.05f) * 8.0f) * speed_dev * 35.0f;
+            }
+        }
+
+        // AFC error: the TV's PLL trying to catch the line sync.
+        // Strong at the top of screen, decays through the field.
+        // Real VCR AFC has pull-in range of ~±500 Hz, time constant ~3-8 lines.
+        afc_error_ = mechanical_wow_ * 0.4f + (speed_dev * 400.0f) + fast_tbe + tape_tension_impulse;
 
         // --- Tape Crease phase ---
-        // --- Multiple Physical Tape Creases (Non-periodic) ---
-        float crease_y1 = std::fmod(tapeTime_ * 0.082f + 0.1f, 1.0f) * float(H);
-        float crease_y2 = std::fmod(tapeTime_ * 0.137f + 0.5f, 1.0f) * float(H);
-        float crease_y3 = std::fmod(tapeTime_ * 0.041f + 0.8f, 1.0f) * float(H);
+        float crease_y = std::fmod(tapeTime_ * 0.1f, 1.0f) * float(H);
 
         out.create(H, W, CV_8UC3);
 
@@ -338,19 +371,41 @@ public:
                 uchar* dr = out.ptr(y);
 
                 // 1. PHYSICAL TAPE GEOMETRY (The "Source" signal)
-                // --- A. Real Simulated AFC (Adaptive Frequency Control) ---
-                // The TV's PLL "catches up" to the tape's line-timing error throughout the field.
-                // This creates the classic "Flagging" at the top and "Jitter" throughout.
-                
-                // Per-line jitter contribution (Scrape Flutter)
-                float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 2.0f)(rng);
-                
-                // AFC Pull-in: Error decays exponentially as the TV catches the sync
-                // topFlagging is the accumulated error at this specific scanline y
-                float line_afc = afc_error_ * std::exp(-float(y) * 0.03f);
-                
+                // Real VHS timebase error is a composite of:
+                //   - AFC pull-in at top of screen (flagging)
+                //   - Fast scrape flutter (tape/head friction, ~50-200 Hz)
+                //   - Guide-roller micro-bounces (impulse-like spikes)
+                //   - Motor belt slips (underdamped ringing)
+                //   - Head-switch transients (bottom VBI tear)
+
+                // Per-line FAST scrape flutter (high-frequency noise)
+                // Real VHS head-to-tape friction creates 50-200 Hz jitter
+                float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 6.0f)(rng);
+
+                // AFC Pull-in: Error decays exponentially as TV catches sync.
+                // Real VHS PLL pull-in time constant is ~3-8 scanlines.
+                // Creates the classic "flagging" bend at the top of screen.
+                float line_afc = afc_error_ * std::exp(-float(y) * 0.125f);  // ~8 line decay
+
+                // Guide-roller micro-bounce: impulsive spike every ~80-200 lines
+                // caused by tape physically bouncing off guide rollers.
+                // Multiple bounce points for more chaotic behavior.
+                float guide_bounce = 0.0f;
+                for (int bounce_idx = 0; bounce_idx < 3; ++bounce_idx) {
+                    float bounce_freq = 2.3f + bounce_idx * 1.7f;  // Different rates
+                    float bounce_y = std::fmod(tapeTime_ * bounce_freq + float(frameNum) * 0.07f * (bounce_idx + 1), 1.0f) * float(H);
+                    float dist_bounce = std::abs(float(y) - bounce_y);
+                    if (dist_bounce > (float)H / 2.0f) dist_bounce = (float)H - dist_bounce;
+                    if (dist_bounce < 15.0f && (speed_dev > 0.005f || ep.flutter_dep > 0.05f)) {
+                        float intensity = std::pow(1.0f - dist_bounce / 15.0f, 2.5f);
+                        // Sharp impulse: asymmetric attack (< 1 line), exponential decay
+                        float attack = intensity * (speed_dev * 30.0f + ep.flutter_dep * 8.0f);
+                        guide_bounce += attack * std::exp(-dist_bounce * 0.4f);
+                    }
+                }
+
                 // Add the immediate physical jitter to the AFC baseline
-                float total_h_warp = line_afc + mechanical_wow_ + scrape_flutter;
+                float total_h_warp = line_afc + mechanical_wow_ + scrape_flutter + guide_bounce;
 
                 // --- B. Motor Drag & Belt Slips (Mid-screen AFC Snapping) ---
                 float drag_hz = 0.5f + ep.motor_health * 2.0f;
@@ -365,15 +420,12 @@ public:
 
                 // --- D. Head Switch Noise (VHS Tearing at bottom of VBI) ---
                 float hsTearing = 0.0f;
-                float hsChromaPhase = 0.0f;
                 // Raised boundary (24 lines) to ensure visibility above overscan
                 if (y >= H - 24) {
                     float hsDepth = (float(y) - (H - 24)) / 24.0f;
                     // Exponential "Hook" characteristic of AFC failing at the switch
                     // Exaggerated gain (35.0) and power curve (3.5)
-                    hsTearing = std::pow(hsDepth, 3.5f) * 35.0f; 
-                    // Add unstable chroma phase jitter in the headswitch region
-                    hsChromaPhase = hsDepth * std::normal_distribution<float>(0, 2.1f)(rng);
+                    hsTearing = std::pow(hsDepth, 3.5f) * 35.0f;
                     // Violent jitter at the very edge (bottom 3 lines)
                     if (y >= H-3) hsTearing += std::normal_distribution<float>(0, 8)(rng);
                 }
@@ -389,58 +441,69 @@ public:
                     tracking_rf = 1.0f - fade * (1.0f - min_rf); 
                 }
 
-                // --- Composite Tape Creases ---
+                // Add tape crease disturbance (Physical V-shaped crinkle)
+                float dist_crease = std::abs(float(src_y) - crease_y);
+                if (dist_crease > (float)H / 2.0f) dist_crease = (float)H - dist_crease;
+                
                 float crease_shear = 0.0f;
-                float crease_chroma = 0.0f;
                 float crease_dropout_prob = 0.0f;
                 
-                auto apply_crease = [&](float cy, float w, float gain) {
-                    float dist = std::abs(float(src_y) - cy);
-                    if (dist > (float)H / 2.0f) dist = (float)H - dist;
-                    if (dist < w) {
-                        float intensity = std::pow(1.0f - (dist / w), 1.5f);
-                        float shear_wave = std::sin(float(y) * 0.4f + wallTime_ * 15.0f) * 8.0f;
-                        crease_shear += intensity * vp.tape_crease * (35.0f + shear_wave) * gain;
-                        crease_chroma += intensity * vp.tape_crease * 3.0f * kPI * std::sin(float(y) * 0.12f);
-                        tracking_rf *= std::max(0.05f, 1.0f - intensity * vp.tape_crease * 2.5f);
-                        crease_dropout_prob = std::max(crease_dropout_prob, intensity * vp.tape_crease * 0.5f);
-                    }
-                };
-                apply_crease(crease_y1, 25.0f * (1.0f + vp.tape_crease), 1.0f);
-                apply_crease(crease_y2, 12.0f * (1.1f + vp.tape_crease), 0.7f);
-                apply_crease(crease_y3, 40.0f * (0.9f + vp.tape_crease), 0.4f);
+                if (vp.tape_crease > 0.01f && dist_crease < 35.0f) {
+                    float intensity = std::pow(1.0f - (dist_crease / 35.0f), 1.5f);
 
-                float current_h_roll = h_roll_phase_ + (float(y) / float(H)) * h_freq_err * 0.033f;
-                float h_sync_roll = current_h_roll * float(W_TOTAL);
+                    // A. Geometric Shear: Sharp V-shape displacement
+                    // Mimics the tape physically buckling away from the head
+                    // High-frequency chaotic oscillation simulates crease
+                    // "catching" on the head edge during playback
+                    float shear_wave = std::sin(float(y) * 0.3f + wallTime_ * 28.0f) * 15.0f
+                                     + std::cos(float(y) * 0.5f - wallTime_ * 43.0f) * 8.0f;
+                    crease_shear = intensity * vp.tape_crease * (50.0f + shear_wave);
+
+                    // B. Signal Degradation
+                    tracking_rf *= std::max(0.05f, 1.0f - intensity * vp.tape_crease * 3.0f);
+                    crease_dropout_prob = intensity * vp.tape_crease * 0.6f;
+                }
+
+                float current_h_roll = h_roll_phase_ * 0.1f;  // Reduced influence
+                float h_sync_roll = current_h_roll * float(W_TOTAL) * (target_error + vp.sync_hold_failure);
 
                 float h_sync_shear = 0.0f;
-                if (tracking_error_lpf_ > 0.0f || vp.tape_crease > 0.0f) {
-                     float chaotic_shear = std::sin(src_y * 0.05f + wallTime_ * 10.0f) * 0.5f 
-                                         + std::cos(src_y * 0.12f - wallTime_ * 15.0f) * 0.3f
-                                         + std::normal_distribution<float>(0, 1)(rng) * 0.2f;
-                     float rf_penalty = (1.0f - tracking_rf) * 3.0f + 1.0f; 
-                     h_sync_shear = (tracking_error_lpf_ * 50.0f) * chaotic_shear * rf_penalty;
+                if (tracking_error_lpf_ > 0.01f || vp.tape_crease > 0.01f) {
+                     // Fast chaotic shear: multiple high-frequency oscillators
+                     // Real VHS tracking errors cause rapid line-to-line shifts
+                     // with frequencies in the 10-80 Hz range.
+                     float chaotic_shear = std::sin(src_y * 0.22f + wallTime_ * 35.0f) * 0.7f
+                                         + std::cos(src_y * 0.35f - wallTime_ * 52.0f) * 0.5f
+                                         + std::sin(src_y * 0.11f + wallTime_ * 19.0f) * 0.4f
+                                         + std::sin(src_y * 0.47f - wallTime_ * 71.0f) * 0.25f
+                                         + std::normal_distribution<float>(0, 1)(rng) * 0.6f;
+                     float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
+                     h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * rf_penalty;
                 }
 
                 float tbe_start = total_h_warp + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
                 
-                // Stretch line internally based on current derivative
-                float tbe_slope = scrape_flutter * 0.1f;
+                // Stretch/squash line internally: simulates tape speed variation
+                // *within* a single scanline (real VHS tape stretches under tension)
+                float tbe_slope = scrape_flutter * 0.25f;
 
                 if (dy > 0.0f && dy < 100.0f) {
-                    // Huge stretch/squash during the snap
-                    tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 15.0f);
+                    // Huge stretch/squash during the motor snap
+                    tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 25.0f);
                 }
 
                 const float linePhase = fPhase + float(y) * kPI;
 
                 // --- ENCODE ---
+                float d_tail = 0.0f;
                 for (int x = 0; x < W_TOTAL; ++x) {
                     float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                     float xSrc = (float)x - current_tbe;
                     xSrc = std::fmod(xSrc, float(W_TOTAL));
                     if (xSrc < 0.0f) xSrc += float(W_TOTAL);
-                    float theta = linePhase + (xSrc * kSC_PX / spd) + hsChromaPhase + crease_chroma;
+                    // Use consistent subcarrier phase: linePhase + xSrc * kSC_PX
+                    // The tape speed affects the subcarrier frequency during playback
+                    float theta = linePhase + xSrc * kSC_PX;
 
                     float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -450,30 +513,36 @@ public:
                         Y = 0.0f;  // Burst
                         I = 0.0f; Q = 0.35f;
                     } else if (xSrc >= H_BLANK) {
+                        // Signal Dropout logic with tail recovery
+                        if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.05f) {
+                            d_tail = 1.0f; // Snap to white/black dropout
+                        }
+                        
                         float vX = std::clamp(xSrc - H_BLANK, 0.f, float(W - 1.001f));
                         int x0 = (int)vX;
                         float r = sr[x0 * 3 + 2] / 255.f;
                         float g = sr[x0 * 3 + 1] / 255.f;
                         float b = sr[x0 * 3 + 0] / 255.f;
+
                         Y = 0.299f * r + 0.587f * g + 0.114f * b;
                         I = 0.596f * r - 0.274f * g - 0.321f * b;
                         Q = 0.211f * r - 0.523f * g + 0.311f * b;
-
-                        // --- SIGNAL DEGRADATION (Multiplicative Thermal Snow) ---
-                        if (tracking_rf < 0.99f) {
-                            float noise_amp = 1.0f - tracking_rf;
-                            // Mix the signal with thermal noise (multiplicative interference)
-                            // This ensures the noise has no fixed IRE floor (avoids "solid white lines")
-                            float noise = std::uniform_real_distribution<float>(-0.15f, 0.45f)(rng); // Subtle gray noise
-                            Y = Y * tracking_rf + noise * noise_amp;
-                            I *= tracking_rf; Q *= tracking_rf;
-                            
-                            // Mechanical dropouts: Rapid signal gaps (Black/Sync level)
-                            if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.04f) {
-                                Y = -0.1f; I = 0.f; Q = 0.f; // Pull to black, not white
-                            }
+                        
+                        if (d_tail > 0.01f) {
+                            // Dropout effect: high-luma 'spark' followed by darkened tail
+                            Y = Y * (1.0f - d_tail) + (d_tail > 0.8f ? 0.8f : -0.2f);
+                            I *= (1.0f - d_tail); Q *= (1.0f - d_tail);
+                            d_tail *= 0.92f; // Decay tail
                         }
                     }
+                    if (tracking_rf < 0.95f && xSrc >= H_BLANK) {
+                         Y *= tracking_rf; I *= tracking_rf; Q *= tracking_rf;
+                         float noise_amp = 1.0f - tracking_rf;
+                         // Denser noise with higher frequency feel
+                         Y += std::uniform_real_distribution<float>(-0.8f, 0.8f)(rng) * noise_amp;
+                         if (noise_amp > 0.35f) { I *= 0.2f; Q *= 0.2f; }
+                    }
+
                     comp_line[x] = Y + I * std::cos(theta) - Q * std::sin(theta);
                 }
 
@@ -511,7 +580,8 @@ public:
 
                     // 1. Adaptive Phase Tracking Simulation
                     pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
-                    float decTheta = linePhase + (float(x) / spd) * kSC_PX + phase_accum + pll_drift_accum;
+                    // Match the encode phase reference: linePhase + x * kSC_PX
+                    float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum;
 
                     // 2. Extract Luma
                     lpY += lpfA * (sig - lpY);
@@ -546,18 +616,39 @@ public:
             uchar* dr = out.ptr(y);
 
             // 1. PHYSICAL TAPE GEOMETRY (The "Source" signal)
-            // --- A. Wow (Tension Flagging at Top of Screen) ---
-            float tension_error = std::sin(tapeTime_ * 1.3f) * ep.wow_dep;
-            // TV AFC exponential catch-up creating the classic "Flag" bend from the top
-            float topFlagging   = std::exp(-float(y) * 0.04f) * tension_error * 15.0f;
+            // Real VHS timebase error is a composite of:
+            //   - AFC pull-in at top of screen (flagging)
+            //   - Fast scrape flutter (tape/head friction, ~50-200 Hz)
+            //   - Guide-roller micro-bounces (impulse-like spikes)
+            //   - Motor belt slips (underdamped ringing)
+            //   - Head-switch transients (bottom VBI tear)
 
-            // --- B. Flutter (High freq jagged horizontal tracking) ---
-            float flutterVal = 0.0f;
-            if (ep.flutter_dep > 0.001f) {
-                flutterVal = (std::sin(wallTime_ * 50.0f + y * 0.15f) * 0.3f 
-                           + std::sin(wallTime_ * 23.0f + y * 0.8f) * 0.1f 
-                           + std::normal_distribution<float>(0, 1)(rng) * 0.2f) * ep.flutter_dep * 5.0f;
+            // Per-line FAST scrape flutter (high-frequency noise)
+            // Real VHS head-to-tape friction creates 50-200 Hz jitter
+            float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 6.0f)(rng);
+
+            // AFC Pull-in: Error decays exponentially as TV catches sync.
+            // Real VHS PLL pull-in time constant is ~3-8 scanlines.
+            // Creates the classic "flagging" bend at the top of screen.
+            float line_afc = afc_error_ * std::exp(-float(y) * 0.125f);  // ~8 line decay
+
+            // Guide-roller micro-bounce: impulsive spike every ~80-200 lines
+            // Multiple bounce points for more chaotic behavior.
+            float guide_bounce = 0.0f;
+            for (int bounce_idx = 0; bounce_idx < 3; ++bounce_idx) {
+                float bounce_freq = 2.3f + bounce_idx * 1.7f;  // Different rates
+                float bounce_y = std::fmod(tapeTime_ * bounce_freq + float(frameNum) * 0.07f * (bounce_idx + 1), 1.0f) * float(H);
+                float dist_bounce = std::abs(float(y) - bounce_y);
+                if (dist_bounce > (float)H / 2.0f) dist_bounce = (float)H - dist_bounce;
+                if (dist_bounce < 15.0f && (speed_dev > 0.005f || ep.flutter_dep > 0.05f)) {
+                    float intensity = std::pow(1.0f - dist_bounce / 15.0f, 2.5f);
+                    float attack = intensity * (speed_dev * 30.0f + ep.flutter_dep * 8.0f);
+                    guide_bounce += attack * std::exp(-dist_bounce * 0.4f);
+                }
             }
+
+            // Add the immediate physical jitter to the AFC baseline
+            float total_h_warp = line_afc + mechanical_wow_ + scrape_flutter + guide_bounce;
 
             // --- C. Motor Drag & Belt Slips (Mid-screen AFC Snapping) ---
             float drag_hz = 0.5f + ep.motor_health * 2.0f;
@@ -594,29 +685,37 @@ public:
             if (dist_crease > (float)H / 2.0f) dist_crease = (float)H - dist_crease;
             float crease_shear = 0.0f;
             if (vp.tape_crease > 0.01f && dist_crease < 15.0f) {
-                crease_shear = (15.0f - dist_crease) * vp.tape_crease * 5.0f;
+                // High-frequency chaotic oscillation simulates crease
+                // "catching" on the head edge during playback
+                float shear_wave = std::sin(float(y) * 0.3f + wallTime_ * 28.0f) * 15.0f
+                                 + std::cos(float(y) * 0.5f - wallTime_ * 43.0f) * 8.0f;
+                crease_shear = (1.0f - dist_crease / 15.0f) * vp.tape_crease * (50.0f + shear_wave);
                 tracking_rf *= std::max(0.1f, 1.0f - vp.tape_crease * (1.0f - dist_crease/15.0f));
             }
 
-            float current_h_roll = h_roll_phase_ + (float(y) / float(H)) * h_freq_err * 0.033f;
-            float h_sync_roll = current_h_roll * float(W_TOTAL);
+            float current_h_roll = h_roll_phase_ * 0.1f;  // Reduced influence
+            float h_sync_roll = current_h_roll * float(W_TOTAL) * (tracking_error_lpf_ + vp.sync_hold_failure);
 
             float h_sync_shear = 0.0f;
-            if (tracking_error_lpf_ > 0.0f || vp.tape_crease > 0.0f) {
-                 float chaotic_shear = std::sin(src_y * 0.05f + wallTime_ * 10.0f) * 0.5f 
-                                     + std::cos(src_y * 0.12f - wallTime_ * 15.0f) * 0.3f
-                                     + std::normal_distribution<float>(0, 1)(rng) * 0.2f;
-                 float rf_penalty = (1.0f - tracking_rf) * 3.0f + 1.0f; 
-                 h_sync_shear = (tracking_error_lpf_ * 50.0f) * chaotic_shear * rf_penalty;
+            if (tracking_error_lpf_ > 0.01f || vp.tape_crease > 0.01f) {
+                 // Fast chaotic shear: multiple high-frequency oscillators
+                 float chaotic_shear = std::sin(src_y * 0.22f + wallTime_ * 35.0f) * 0.7f
+                                     + std::cos(src_y * 0.35f - wallTime_ * 52.0f) * 0.5f
+                                     + std::sin(src_y * 0.11f + wallTime_ * 19.0f) * 0.4f
+                                     + std::sin(src_y * 0.47f - wallTime_ * 71.0f) * 0.25f
+                                     + std::normal_distribution<float>(0, 1)(rng) * 0.6f;
+                 float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
+                 h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * rf_penalty;
             }
 
-            float tbe_start = topFlagging + flutterVal + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
-            
-            // Stretch line internally based on current derivative
-            float tbe_slope = std::normal_distribution<float>(0, 1)(rng) * ep.flutter_dep * 0.5f;
+            float tbe_start = total_h_warp + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
+
+            // Stretch/squash line internally: simulates tape speed variation
+            // *within* a single scanline (real VHS tape stretches under tension)
+            float tbe_slope = scrape_flutter * 0.25f;
             if (dy > 0.0f && dy < 100.0f) {
-                // Huge stretch/squash during the snap
-                tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 15.0f);
+                // Huge stretch/squash during the motor snap
+                tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 25.0f);
             }
 
             const float linePhase = fPhase + float(y) * kPI;
@@ -625,7 +724,7 @@ public:
             for (int x = 0; x < W_TOTAL; ++x) {
                 float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                 float xSrc = (float)x - current_tbe;
-                float theta = linePhase + xSrc * kSC_PX / spd;
+                float theta = linePhase + xSrc * kSC_PX;
 
                 float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -687,7 +786,8 @@ public:
 
                 // 1. Adaptive Phase Tracking Simulation
                 pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
-                float decTheta = linePhase + (float(x) / spd) * kSC_PX + phase_accum + pll_drift_accum;
+                // Match the encode phase reference: linePhase + x * kSC_PX
+                float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum;
 
                 // 2. Extract Luma
                 lpY += lpfA * (sig - lpY);
@@ -855,6 +955,7 @@ static void apply(const cv::Mat& s,cv::Mat& d,const Params& p){
 static std::atomic<int64_t> g_audioSamplePos{0};
 static std::atomic<float>   g_sourceFPS{kNTSC_FPS};  // default to NTSC 29.97
 static std::atomic<bool>    g_videoReset{false};
+static std::atomic<bool>    g_pipelineFlush{false};  // clear queues + reset counters
 
 // ============================================================
 //  §7  ProcessParams & Pipeline
@@ -872,6 +973,7 @@ struct ExportContext {
     FILE*             audioFp = nullptr;
     uint32_t          audioFramesWritten = 0;
     std::atomic<bool> isClosing{false};
+    TapeEngine*       tapeEnginePtr = nullptr; // Non-owning pointer for read-only access
 };
 
 struct ProcessParams {
@@ -882,12 +984,10 @@ struct ProcessParams {
     VideoParams       vpSnap;
     float             tapeSpd{1.f};
     float             instantSpd{1.f};
-    bool              engValid{false};
-    bool              isPlaying{false};
+    std::atomic<bool> engValid{false};
     std::atomic<int>  spdIdx{0};
-    AudioIO*          audioIO = nullptr;     // AUTHORITATIVE SYNC POINTERS
-    TransportDynamics* transport = nullptr;
-    ExportContext*    exPtr=nullptr;
+    float             av_sync_offset_ms{0.f};
+    ExportContext*    exPtr=nullptr; // Pointer to AppState.exportCtx
 };
 
 class ProcessingPipeline {
@@ -911,36 +1011,33 @@ private:
         ntsc_.initBuffers(FW,FH);
         cv::Mat last_raw;
         auto loop_timer = std::chrono::steady_clock::now();
+        auto wallPrev = std::chrono::steady_clock::now();
         while(running_){
+            // ── PIPELINE FLUSH ──────────────────────────────────────────────
+            // Clear all queued frames and reset counters when switching sources.
+            // Prevents showing stale demo frames while loading a video file.
+            if (g_pipelineFlush.exchange(false)) {
+                rawQ.clear();
+                outQ.clear();
+                last_raw = cv::Mat{};
+                frameNum_ = 0;
+            }
+
             int64_t apos = g_audioSamplePos.load();
             float sf = g_sourceFPS.load();
             
-            // ── AUDIO-SYNC THROTTLING ────────────────────────────────────────
-            bool isExport = (pp.exPtr && pp.exPtr->active);
-            
-            if (!isExport) {
-                if (pp.engValid && pp.isPlaying && sf > 0.1f) {
-                    // Real-time playback: stay ~2 frames ahead of audio output
-                    int64_t latencyComp = 2048; 
-                    if (pp.audioIO) latencyComp = pp.audioIO->get_hardware_delay();
-                    int64_t adjApos = std::max((int64_t)0, apos - latencyComp);
-                    int64_t targetFrame = int64_t(double(adjApos) / (AUDIO_SR / sf));
-                    
-                    if (frameNum_ > targetFrame + 4) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
-                } else if (!pp.engValid || !pp.isPlaying) {
-                    // Fallback: fixed 30fps timer for demo/camera or stopped state
-                    auto now_time = std::chrono::steady_clock::now();
-                    long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now_time - loop_timer).count();
-                    if (elapsed < 32) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                        continue;
-                    }
-                    loop_timer = now_time;
-                }
+            // ── PIPELINE RATE LIMITING — run at wall-clock rate (~30fps) ───
+            // The audio clock controls VIDEO SEEK (capture thread), NOT
+            // the processing rate. The NTSC pipeline always runs at full
+            // wall-clock speed so effects (flutter, head-switch, V-roll)
+            // maintain their natural timing regardless of tape speed.
+            auto now_time = std::chrono::steady_clock::now();
+            long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now_time - loop_timer).count();
+            if (elapsed < 32) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
             }
+            loop_timer = now_time;
 
             cv::Mat raw; 
             if(!rawQ.try_pop(raw)) {
@@ -971,33 +1068,43 @@ private:
              hasEng=pp.engValid;si=pp.spdIdx.load();}
             if(!hasEng){switch(si){case 1:ep.ips_base=7.5f;break;case 2:ep.ips_base=3.75f;break;default:ep.ips_base=15.f;}}
             static float ph=0.f; ph+=.01f; if(ph>1.f)ph-=1.f; fx.phase=ph;
-            cv::Mat eff, proc;
-            Effects::apply(raw, eff, fx);
-            if (ntscOn) {
-                if (!hasEng) {
-                    EngineParams def{}; def.ips_base = 15.f; def.hiss = .003f; def.wow_dep = .3f; def.flutter_dep = .08f;
+            cv::Mat eff,proc;
+            Effects::apply(raw,eff,fx);
+
+            // Real wall-clock delta for NTSC oscillators
+            auto wallNow = std::chrono::steady_clock::now();
+            float wallDt = std::chrono::duration<float>(wallNow - wallPrev).count();
+            wallPrev = wallNow;
+            // Only clamp tiny values (first frame jitter). Don't clamp large values
+            // — when pipeline is rate-limited by audio clock, wallDt MUST be large
+            // so NTSC oscillators scale proportionally.
+            if (wallDt < 0.001f) wallDt = kNTSC_FRAME_S;
+
+            if(ntscOn){
+                if(!hasEng){EngineParams def{};def.ips_base=15.f;def.hiss=.003f;def.wow_dep=.3f;def.flutter_dep=.08f;
                     ntsc_.tapeTime_ = (float)frameNum_ / kNTSC_FPS;
-                    ntsc_.process(eff, proc, frameNum_, def, vp, 1.f, 1.f);
-                }
+                    ntsc_.process(eff,proc,frameNum_,def,vp,1.f,1.f,wallDt);}
                 else {
-                    // AUTHORITATIVE HARDWARE-LOCKED SYNC
-                    int64_t latencyComp = 0;
-                    if (!isExport && pp.audioIO) {
-                        latencyComp = pp.audioIO->get_hardware_delay();
-                    }
-                    
+                    float syncOffset = pp.av_sync_offset_ms;
+                    int64_t latencyComp = int64_t(syncOffset * AUDIO_SR / 1000.0f);
                     int64_t adjApos = std::max((int64_t)0, g_audioSamplePos.load() - latencyComp);
-                    
-                    float histSpd = spd;
-                    if (pp.transport) {
-                        histSpd = pp.transport->speed_history[uint64_t(adjApos) % TransportDynamics::SPEED_HIST_SIZE];
+
+                    // Retrieve the precise speed that was active when this audio was generated
+                    float histSpd = spd; // fallback to latest
+                    if (pp.engValid.load() && pp.exPtr && pp.exPtr->tapeEnginePtr) {
+                        uint64_t idx = uint64_t(adjApos) % TransportDynamics::SPEED_HIST_SIZE;
+                        histSpd = pp.exPtr->tapeEnginePtr->transport.speed_history[idx];
+                        // Guard against NaN/Inf from uninitialized history
+                        if (!std::isfinite(histSpd)) histSpd = spd;
                     }
 
                     ntsc_.tapeTime_ = (float)adjApos / AUDIO_SR;
-                    ntsc_.process(eff, proc, frameNum_, ep, vp, spd, histSpd);
-                }
-            }
-            else proc = eff;
+                    ntsc_.process(eff,proc,frameNum_,ep,vp,spd,histSpd,wallDt);
+                }}
+
+
+
+            else proc=eff;
             
             // Recording hook removed - now handled asynchronously in recordThread
 
@@ -1053,7 +1160,7 @@ private:
                 }else if(src==SourceType::File&&!fp.empty()){
                     std::string wav=extractAudioToWav(fp);
                     if(!running_.load()) return;
-                    
+
                     cap.open(fp);
                     if(!cap.isOpened()){
                         if(fileMuPtr){std::lock_guard<std::mutex> lk(*fileMuPtr);}
@@ -1061,7 +1168,13 @@ private:
                     } else {
                          if(!running_.load()) return;
                          if(!wav.empty()&&onAudioFileReady) onAudioFileReady(wav);
-                         
+
+                         // Clear all queued frames so the pipeline doesn't show stale output
+                         // while the engine was loading
+                         outQ.clear();
+                         g_pipelineFlush.store(true);
+                         g_videoReset.store(true);
+
                          srcFPS=cap.get(cv::CAP_PROP_FPS); if(srcFPS<=0)srcFPS=kNTSC_FPS;
                          g_sourceFPS.store(float(srcFPS)); g_videoReset.store(true);
                     }
@@ -1084,8 +1197,12 @@ private:
             }else if(cap.isOpened()){
                 // Audio-clock-driven video seek
                 int64_t apos=g_audioSamplePos.load();
+                // Apply same latency compensation as processing pipeline
+                // so capture reads frames at the position the pipeline expects
+                int64_t latencyComp = 2048;
+                int64_t adjApos = std::max((int64_t)0, apos - latencyComp);
                 double spf=AUDIO_SR/srcFPS;
-                int64_t targetFrame=int64_t(double(apos)/spf);
+                int64_t targetFrame=int64_t(double(adjApos)/spf);
                 int64_t curFrame=int64_t(cap.get(cv::CAP_PROP_POS_FRAMES));
                 int64_t delta=targetFrame-curFrame;
                 if(delta>4) cap.set(cv::CAP_PROP_POS_FRAMES,double(targetFrame));
@@ -1154,7 +1271,8 @@ struct AppState {
     uint64_t startMs=SDL_GetTicks64();
     VideoParams videoParams;
     EngineParams baseParams;
-    
+    float av_sync_offset_ms{0.f};
+
     void setParam(std::function<void(EngineParams&)> fn){
         fn(baseParams);
     }
@@ -1468,12 +1586,15 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
            locked=app.tapeEngine&&app.audioIO&&app.audioIO->is_open(); }
          
          ImGui::Spacing();
-          if (app.tapeEngine && app.audioIO) {
-              int64_t lat = app.audioIO->get_hardware_delay();
-              ImGui::Text("DAC BUFFER %7lld smp",(long long)lat);
-              ImGui::Text("AUTO DELAY %7.1f ms",(double)lat * 1000.0 / AUDIO_SR);
-          }
-          ImGui::PopStyleColor(); ImGui::EndChild();
+         if(locked) ImGui::TextColored({0.f,.9f,.4f,1.f},"● A/V LOCKED");
+         else        ImGui::TextColored({.9f,.3f,.3f,1.f},"○ FREE-RUN");
+         
+         ImGui::Spacing();
+         ImGui::PushStyleColor(ImGuiCol_Text, {1.f, .8f, .2f, 1.f});
+         ImGui::SetNextItemWidth(sw2-10);
+         ImGui::SliderFloat("A/V SYNC (ms)", &app.av_sync_offset_ms, 0.0f, 500.0f, "%.0f ms");
+         ImGui::PopStyleColor();
+         ImGui::PopStyleColor(); ImGui::EndChild();
          ImVec2 lb={cp.x,cp.y+sh2+6};
          dl->AddRectFilled(lb,{lb.x+sw2+8,lb.y+16},IM_COL32(12,12,12,255));
          dl->AddCircleFilled({lb.x+8,lb.y+8},4.f,locked?IM_COL32(0,220,100,255):IM_COL32(200,50,50,255));
@@ -1504,7 +1625,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         if(!oldWav.empty()) std::remove(oldWav.c_str());
         
         app.pipeline.rawQ.clear(); app.pipeline.outQ.clear();
-        std::lock_guard<std::mutex> lk2(app.pp.mu); app.pp.engValid=false;
+        std::lock_guard<std::mutex> lk2(app.pp.mu); app.pp.engValid.store(false);
     };
 
     auto srcBtnWithStop=[&](const char* lbl,SourceType st){
@@ -1572,13 +1693,15 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         std::lock_guard<std::mutex> lk(app.pp.mu);app.pp.spdIdx=app.tapeSpeedIdx;
     }
     { std::lock_guard<std::mutex> a_lk(app.audioMu);
-      if(app.tapeEngine){
+    if(app.tapeEngine){
         bool tCh=false;
         auto sl3=[&](const char*n,float*v,float lo,float hi){
             ImGui::SetNextItemWidth(colW-130);tCh|=ImGui::SliderFloat(n,v,lo,hi);};
         EngineParams& bp=app.baseParams;
         sectionHdr("TRANSPORT");
-        sl3("WOW",&bp.wow_dep,0,5);sl3("FLUTTER",&bp.flutter_dep,0,1);
+        sl3("WOW",&bp.wow_dep,0,5);
+        sl3("FLUTTER",&bp.flutter_dep,0,1);
+        bp.flutter_dep = std::max(bp.flutter_dep, 0.001f); // floor to avoid pathological zero
         sl3("MOTOR HLTH",&bp.motor_health,0,.9f);
         sl3("MOTOR DRAG",&bp.motor_drag,0,.9f);sl3("DROPOUT",&bp.dropout_rate,0,.1f);
         sectionHdr("VCR GEOMETRY WARPING");
@@ -1593,16 +1716,14 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         sl3("HF CUTOFF",&bp.cutoff_base,1000,20000);
         {
             std::lock_guard<std::mutex> lk2(app.pp.mu);
-            bp.tracking_error = app.videoParams.tracking_error; 
-            app.pp.epSnap=bp;app.pp.tapeSpd=bp.tape_speed_mult;app.pp.engValid=true;
+            bp.tracking_error = app.videoParams.tracking_error; // Link to audio engine
+            app.pp.epSnap=bp;app.pp.tapeSpd=bp.tape_speed_mult;app.pp.engValid.store(true);
         }
-        
+
         float vL=0, vR=0;
         if(app.audioIO){ vL=app.audioIO->get_level_left(); vR=app.audioIO->get_level_right(); }
         app.vuL = vL; app.vuR = vR;
-      } else {
-        ImGui::Spacing();ImGui::TextColored({.9f,.3f,.3f,1.f},"Load video file to enable tape DSP");
-      }
+    }else{ImGui::Spacing();ImGui::TextColored({.9f,.3f,.3f,1.f},"Load video file to enable tape DSP");}
     }
     
     // Cleanup old audio files if they accumulate?
@@ -1631,7 +1752,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     for(auto&pr:prs){
         if(ImGui::Button(pr.n,{colW-18,0})){
             app.setParam(pr.fn);
-            std::lock_guard<std::mutex> lk2(app.pp.mu);app.pp.epSnap=app.baseParams;app.pp.tapeSpd=app.baseParams.tape_speed_mult;app.pp.engValid=true;}}
+            std::lock_guard<std::mutex> lk2(app.pp.mu);app.pp.epSnap=app.baseParams;app.pp.tapeSpd=app.baseParams.tape_speed_mult;app.pp.engValid.store(true);}}
     
     sectionHdr("AUDIO METERS");
     ImGui::Text("L:"); ImGui::SameLine(); vuBar(app.vuL,colW-46,10,app.vuL>.95f);
@@ -1749,7 +1870,6 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
      if(locked)ImGui::TextColored({0.f,.9f,.4f,1.f},"● A/V LOCKED");
      else       ImGui::TextColored({.9f,.3f,.3f,1.f},"○ FREE-RUN");}
     ImGui::EndChild();
-    ImGui::EndChild();
     ImGui::End();
 }
 
@@ -1796,17 +1916,21 @@ int main(int,char**){
             std::lock_guard<std::mutex> lk(app.audioMu);
             // Safely stop and replace the current engine/IO
             if(app.audioIO){ app.audioIO->stop(); app.audioIO->close(); }
-            
+
             { std::lock_guard<std::mutex> flk(app.fileMu); app.audioWavPath=wav; }
-            app.tapeEngine=std::move(eng); 
+            app.tapeEngine=std::move(eng);
             app.audioIO=std::move(aio);
             g_audioSamplePos.store(0);
             app.baseParams=app.tapeEngine->params;
 
+            // Clear last displayed frames so UI doesn't show stale output
+            { std::lock_guard<std::mutex> flk(app.frameMu);
+              app.lastOut = cv::Mat{}; app.lastRaw = cv::Mat{}; }
+
             std::lock_guard<std::mutex> lk2(app.pp.mu);
             app.pp.epSnap=app.baseParams;
             app.pp.tapeSpd=app.baseParams.tape_speed_mult;
-            app.pp.engValid=true;
+            app.pp.engValid.store(true);
             
             // Cleanup the temporary WAV file AFTER we're sure the engine is running
             // Actually, we can't delete it while TapeEngine is using it via StreamBuffer.
@@ -1894,12 +2018,16 @@ int main(int,char**){
 
     bool running=true; SDL_Event evt;
     auto lastPoll=std::chrono::steady_clock::now();
+    double wallTimeAccum = 0.0;
 
     while(running){
-        // Advance audio clock from wall-clock
+        // Advance real wall-clock (once per UI iteration, independent of frame rate)
         {auto now=std::chrono::steady_clock::now();
+         double dt = std::chrono::duration<double>(now - lastPoll).count();
+         wallTimeAccum += dt;
+         g_wallTimeSec.store(wallTimeAccum);
          lastPoll=now;
-         
+
          std::lock_guard<std::mutex> a_lk(app.audioMu);
          if(app.tapeEngine&&app.audioIO&&app.audioIO->is_open()){
              EngineParams active = app.baseParams;
@@ -1964,29 +2092,34 @@ int main(int,char**){
 
              float spd=1.f;
              {std::lock_guard<std::mutex> lk(app.tapeEngine->lock);
-              // Preserve transport state from the AudioIO thread
-              float m_spd = app.tapeEngine->params.tape_speed_mult;
+              // Read the DSP thread's inertia ramp (0→1 spinup, ~1.0 at steady state).
+              // This controls actual playback engagement — NOT tape format speed.
+              float inertia_ramp = app.audioIO->current_speed_mult();
+
+              // tape_speed_mult = 1.0 for normal playback regardless of ips_base.
+              // SP/LP/EP only changes artifact CHARACTER (hiss, flutter, bandwidth),
+              // not the actual playback rate. This matches real VCR behavior.
+              spd = inertia_ramp;
+
               float m_eng = app.tapeEngine->params.motor_engage;
               bool  m_rev = app.tapeEngine->params.is_reversed;
               app.tapeEngine->params = active;
-              app.tapeEngine->params.tape_speed_mult = m_spd;
+              app.tapeEngine->params.tape_speed_mult = spd;
               app.tapeEngine->params.motor_engage    = m_eng;
               app.tapeEngine->params.is_reversed     = m_rev;
-              
-              spd=std::clamp(m_spd,.01f,4.f);}
+
+              spd = std::clamp(spd, .01f, 4.f);
+             }
              g_audioSamplePos.store(int64_t(app.tapeEngine->play_head));
              int64_t total=app.tapeEngine->total_samples;
              if(total>0&&g_audioSamplePos.load()>total) g_audioSamplePos.store(0);
-              {std::lock_guard<std::mutex> lk(app.pp.mu);
-               app.pp.epSnap=active;
-               app.pp.vpSnap=app.videoParams;
-               app.pp.audioIO = app.audioIO.get();
-               app.pp.transport = (app.tapeEngine ? &app.tapeEngine->transport : nullptr);
-               app.pp.isPlaying = (app.tapeEngine ? app.tapeEngine->is_playing.load() : false);
-               app.pp.tapeSpd=spd; app.pp.instantSpd=app.tapeEngine->transport.last_instant_speed; app.pp.engValid=true;
-              }
-          }
-         }
+             {std::lock_guard<std::mutex> lk(app.pp.mu);
+              app.pp.epSnap=active;
+              app.pp.vpSnap=app.videoParams;
+              app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
+              app.pp.tapeSpd=spd; app.pp.instantSpd=app.tapeEngine->transport.last_instant_speed; app.pp.engValid.store(true);
+              app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
+             }}}
 
         // Copy lastOut to lastRaw for source monitor
         {std::lock_guard<std::mutex> lk(app.frameMu);
