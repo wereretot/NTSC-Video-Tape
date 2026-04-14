@@ -230,6 +230,20 @@ struct VideoParams {
     float tracking_error = 0.0f;
     float tape_crease = 0.0f;
     float sync_hold_failure = 0.0f;
+    float tape_age = 0.0f;
+
+    float dropout_rate = 0.0f;
+    float motor_health = 0.0f;
+    float oxide_shedding = 0.0f;
+    float demagnetization = 0.0f;
+    float sticky_shed = 0.0f;
+
+    float base_rf_level = 1.0f;
+    float chroma_level = 1.0f;
+    float luma_noise = 0.0f;
+    float chroma_noise = 0.0f;
+    float dropout_intensity = 0.0f;
+    float signal_strength = 1.0f;
 };
 
 class NTSCSimulator {
@@ -240,6 +254,12 @@ public:
     float wallTime_ = 0.0f;
     float h_roll_phase_ = 0.0f;
     float tracking_error_lpf_ = 0.0f;
+    float tracking_lock_ = 1.0f;
+    float motor_top_bend_phase_ = 0.0f;
+    float motor_top_bend_lpf_ = 0.0f;
+    float crinkle_center_lpf_ = 0.0f;
+    float crinkle_strength_lpf_ = 0.0f;
+    float crinkle_phase_ = 0.0f;
     float mechanical_wow_ = 0.0f;
     float mechanical_flutter_ = 0.0f;
     float afc_error_ = 0.0f;
@@ -268,6 +288,72 @@ public:
         // from this value — NOTHING is accumulated per frame, so tape speed
         // and pipeline frame rate cannot affect effect timing.
         wallTime_ = (float)g_wallTimeSec.load();
+
+        float tracking_deg = std::clamp(vp.tracking_error, 0.0f, 1.0f);
+        float dropout_deg = std::clamp(vp.dropout_rate * 10.0f, 0.0f, 1.0f);
+        float motor_deg = std::clamp(vp.motor_health, 0.0f, 1.0f);
+        float crease_deg = std::clamp(vp.tape_crease, 0.0f, 1.0f);
+        float oxide_deg = std::clamp(vp.oxide_shedding, 0.0f, 1.0f);
+        float demag_deg = std::clamp(vp.demagnetization, 0.0f, 1.0f);
+        float sticky_deg = std::clamp(vp.sticky_shed, 0.0f, 1.0f);
+        float age_deg = std::clamp(vp.tape_age, 0.0f, 1.0f);
+
+        float rf_level = 1.0f - tracking_deg * 0.7f
+                               - dropout_deg * 0.3f
+                               - oxide_deg * 0.4f
+                               - crease_deg * 0.5f
+                               - age_deg * 0.3f;
+        rf_level = std::clamp(rf_level, 0.05f, 1.0f);
+
+        float chroma_attenuation = 1.0f - tracking_deg * 0.6f
+                                         - motor_deg * 0.3f
+                                         - demag_deg * 0.55f
+                                         - oxide_deg * 0.25f
+                                         - age_deg * 0.2f;
+        chroma_attenuation = std::clamp(chroma_attenuation, 0.03f, 1.0f);
+
+        float luma_noise_level = tracking_deg * 0.5f
+                               + dropout_deg * 0.3f
+                               + oxide_deg * 0.4f
+                               + age_deg * 0.3f
+                               + sticky_deg * 0.2f;
+        float chroma_noise_level = tracking_deg * 0.6f
+                                 + motor_deg * 0.4f
+                                 + demag_deg * 0.5f
+                                 + oxide_deg * 0.3f;
+        float wear_noise = std::clamp(
+            (1.0f - rf_level) * 0.9f + luma_noise_level * 0.25f + chroma_noise_level * 0.2f,
+            0.0f,
+            1.2f);
+
+        float dropout_drive = std::clamp(
+            vp.dropout_rate + vp.oxide_shedding * 0.16f + vp.sticky_shed * 0.10f + vp.tape_age * 0.08f + vp.tape_crease * 0.03f,
+            0.0f,
+            0.25f);
+
+        // --- Tracking Pulse & Flyback Lock Model ---
+        // Simulates control/sync pulse strength that a CRT flyback/H+V oscillator
+        // can lock onto. Worn tape weakens pulse amplitude and causes unstable lock.
+        float tracking_pulse_strength = std::clamp(
+            rf_level
+            - oxide_deg * 0.45f
+            - demag_deg * 0.35f
+            - sticky_deg * 0.22f
+            - age_deg * 0.30f
+            - motor_deg * 0.10f
+            - ep.motor_drag * 0.16f
+            - dropout_drive * 1.8f
+            - vp.sync_hold_failure * 0.30f,
+            0.0f,
+            1.0f);
+
+        float lock_target = std::clamp((tracking_pulse_strength - 0.18f) / 0.72f, 0.0f, 1.0f);
+        float lock_attack = 1.0f - std::exp(-wallDt * 7.0f);
+        float lock_release = 1.0f - std::exp(-wallDt * 2.2f);
+        float lock_alpha = (lock_target > tracking_lock_) ? lock_attack : lock_release;
+        tracking_lock_ += (lock_target - tracking_lock_) * lock_alpha;
+        tracking_lock_ = std::clamp(tracking_lock_, 0.0f, 1.0f);
+        float unlock = 1.0f - tracking_lock_;
 
         // Field phase: NTSC fields at 59.94 Hz
         const float fPhase = std::fmod(wallTime_ * (kNTSC_FPS * 2.f), 4.f) * (kPI * 0.5f);
@@ -304,6 +390,15 @@ public:
         float wow_dev = wow_sum * ep.wow_dep * 0.01f;        // up to ±5% at max
         float flutter_dev = flutter_sum * ep.flutter_dep * 0.008f;  // up to ±0.8% at max
 
+        // Wow/flutter and transport drag also disturb sync pulse lock.
+        float sync_transport_dev = std::abs(instantSpd - std::max(tapeSpd, 0.001f)) / std::max(tapeSpd, 0.001f);
+        float wow_flutter_stress = std::clamp(std::abs(wow_dev) * 10.0f + std::abs(flutter_dev) * 20.0f, 0.0f, 1.0f);
+        float drag_stress = std::clamp(ep.motor_drag * 1.2f + sync_transport_dev * 1.5f + motor_deg * 0.5f, 0.0f, 1.0f);
+        float lock_disturb = std::clamp(wow_flutter_stress * 0.25f + drag_stress * 0.30f, 0.0f, 1.0f);
+        tracking_lock_ -= lock_disturb * (1.0f - std::exp(-wallDt * 4.0f));
+        tracking_lock_ = std::clamp(tracking_lock_, 0.0f, 1.0f);
+        unlock = 1.0f - tracking_lock_;
+
         // Note: Real VHS does NOT accumulate subcarrier phase error frame-to-frame.
         // The VCR re-generates the color burst at a clean reference every field,
         // and the TV's color PLL locks to that burst. Residual chroma errors come
@@ -314,7 +409,7 @@ public:
 
         // --- V-SYNC LOSS (Rolling) & TAPE SPEED ERROR ---
         float speed_error = std::abs(1.0f - instantSpd);
-        float target_error = speed_error + vp.tracking_error;
+        float target_error = speed_error + vp.tracking_error + unlock * (0.18f + dropout_drive * 1.2f);
         if (target_error > 2.0f) target_error = 2.0f;
 
         // Low-pass filter on tracking error (per-frame → use absolute wall-clock)
@@ -332,9 +427,9 @@ public:
         }
 
         float v_jitter = 0.0f;
-        if (target_error > 0.1f) {
+        if (target_error > 0.1f || unlock > 0.05f) {
             std::mt19937 jRng(uint32_t(frameNum) * 999u);
-            v_jitter = std::normal_distribution<float>(0, target_error * 10.0f)(jRng);
+            v_jitter = std::normal_distribution<float>(0, target_error * 10.0f + unlock * 14.0f)(jRng);
         }
 
         int v_roll = (int(v_roll_accum_ + v_jitter)) % H;
@@ -347,14 +442,14 @@ public:
         noise_bar_phase_ = std::fmod(wallTime_ * noise_bar_rate, 1.0f);
         if (noise_bar_phase_ < 0.0f) noise_bar_phase_ += 1.0f;
         float bar_y = noise_bar_phase_ * float(H);
-        float bar_width = 20.0f + tracking_error_lpf_ * 80.0f;
+        float bar_width = 20.0f + tracking_error_lpf_ * 80.0f + unlock * 35.0f;
 
         // --- H-SYNC Roll — absolute phase ---
         // Real VHS H-sync errors are FAST: the horizontal oscillator
         // in a CRT TV runs at 15,734 Hz and any deviation from the
         // broadcast signal causes immediate phase drift. When tape
         // speed is wrong, H-sync rolls at 2-15 Hz depending on error.
-        float h_freq_err = (target_error * 12.0f) + (vp.sync_hold_failure * 60.0f);
+        float h_freq_err = (target_error * 12.0f) + (vp.sync_hold_failure * 60.0f) + unlock * (12.0f + dropout_drive * 42.0f);
         if (h_freq_err > 0.01f) {
             h_roll_phase_ = std::fmod(h_roll_phase_ - wallDt * h_freq_err, 1.0f);
             if (h_roll_phase_ < 0.0f) h_roll_phase_ += 1.0f;
@@ -381,7 +476,7 @@ public:
         //   3. Drum wobble: bearing wear transmits vibration to tape path
         //   4. Speed surges: motor can't maintain constant RPM
         // These get WORSE as motor_health approaches 1.0 (fully degraded).
-        float motor_defect = std::clamp(ep.motor_health, 0.0f, 1.0f);
+        float motor_defect = std::clamp(vp.motor_health, 0.0f, 1.0f);
 
         // Motor cogging: discrete "notches" as the rotor passes each pole.
         // Creates a staircase-like horizontal displacement that jumps every
@@ -412,6 +507,18 @@ public:
                 std::sin(tapeTime_ * motor_rpm_hz * 2.0f * kPI) * 0.6f +
                 std::sin(tapeTime_ * motor_rpm_hz * 4.0f * kPI) * 0.3f);
         }
+
+        // Dedicated top-of-screen bending from motor degradation/drag.
+        // Keep this relatively stable and slow so classic top flagging is visible.
+        float motor_top_bend_target = (motor_defect * 24.0f + ep.motor_drag * 30.0f)
+                                     * (0.72f + std::clamp(wow_flutter_stress, 0.0f, 1.0f) * 0.28f);
+        float bend_lpf_a = 1.0f - std::exp(-wallDt * 1.6f);
+        motor_top_bend_lpf_ += (motor_top_bend_target - motor_top_bend_lpf_) * bend_lpf_a;
+        float bend_hz = 0.18f + motor_defect * 0.30f + ep.motor_drag * 0.20f;
+        motor_top_bend_phase_ = std::fmod(motor_top_bend_phase_ + wallDt * bend_hz, 1.0f);
+        float bend_phase = motor_top_bend_phase_ * 2.0f * kPI;
+        float motor_top_bend_amp = motor_top_bend_lpf_ * (
+            0.82f + 0.15f * std::sin(bend_phase) + 0.06f * std::sin(bend_phase * 0.47f + 1.1f));
 
         // Fast timebase error: high-frequency jitter from tape scraping
         // past heads. Realistic VHS TBE is 1-15 pixels peak-to-peak
@@ -454,6 +561,27 @@ public:
 
         // --- Tape Crease phase ---
         float crease_y = std::fmod(tapeTime_ * 0.1f, 1.0f) * float(H);
+        crinkle_phase_ = std::fmod(crinkle_phase_ + wallDt * (0.12f + crease_deg * 0.55f), 1.0f);
+        float crinkle_phase_rad = crinkle_phase_ * 2.0f * kPI;
+        float crinkle_center_target = crease_y
+            + std::sin(crinkle_phase_rad * 0.71f + 1.2f) * (float(H) * (0.08f + crease_deg * 0.18f))
+            + std::cos(crinkle_phase_rad * 1.33f - 0.6f) * (float(H) * 0.05f);
+        while (crinkle_center_target < 0.0f) crinkle_center_target += float(H);
+        while (crinkle_center_target >= float(H)) crinkle_center_target -= float(H);
+        float crinkle_center_alpha = 1.0f - std::exp(-wallDt * 2.4f);
+        if (crinkle_center_lpf_ <= 0.0f) crinkle_center_lpf_ = crease_y;
+        crinkle_center_lpf_ += (crinkle_center_target - crinkle_center_lpf_) * crinkle_center_alpha;
+        while (crinkle_center_lpf_ < 0.0f) crinkle_center_lpf_ += float(H);
+        while (crinkle_center_lpf_ >= float(H)) crinkle_center_lpf_ -= float(H);
+
+        float crinkle_pulse = 0.5f + 0.5f * std::sin(crinkle_phase_rad * 1.9f + 0.8f);
+        float crinkle_strength_target = std::pow(crease_deg, 1.15f) * (0.35f + 0.65f * crinkle_pulse);
+        float crinkle_strength_alpha = 1.0f - std::exp(-wallDt * (1.8f + crease_deg * 3.0f));
+        crinkle_strength_lpf_ += (crinkle_strength_target - crinkle_strength_lpf_) * crinkle_strength_alpha;
+        crinkle_strength_lpf_ = std::clamp(crinkle_strength_lpf_, 0.0f, 1.0f);
+        float crinkle_center_y = crinkle_center_lpf_;
+        float crinkle_band = 10.0f + 55.0f * crease_deg;
+        float crinkle_strength = crinkle_strength_lpf_;
 
         out.create(H, W, CV_8UC3);
 
@@ -488,6 +616,14 @@ public:
                 // Creates the classic "flagging" bend at the top of screen.
                 // The bending extends ~20-30 lines down from the top.
                 float line_afc = afc_error_ * std::exp(-float(y) * 0.08f);  // ~30 line decay
+                float motor_top_bend = motor_top_bend_amp
+                    * std::exp(-float(y) * 0.055f)
+                    * (1.0f + 0.08f * std::sin(tapeTime_ * 4.0f + float(y) * 0.02f));
+                line_afc += motor_top_bend;
+                float flyback_unlock_jitter = unlock * (6.0f + age_deg * 14.0f + sticky_deg * 18.0f)
+                    * std::sin(float(y) * 0.42f + wallTime_ * 91.0f);
+                float unlock_top_gate = 1.0f - std::exp(-float(y) * 0.06f);
+                line_afc += flyback_unlock_jitter * unlock_top_gate;
 
                 // Guide-roller micro-bounce: impulsive spike every ~80-200 lines
                 // caused by tape physically bouncing off guide rollers.
@@ -572,12 +708,13 @@ public:
                 // Tracking RF Mask
                 float dist_rf = std::abs(float(src_y) - bar_y);
                 if (dist_rf > (float)H / 2.0f) dist_rf = (float)H - dist_rf; 
-                float tracking_rf = 1.0f;
+                float tracking_rf = rf_level;
                 if (dist_rf < bar_width) {
                     float min_rf = dist_rf / bar_width;
                     float fade = std::clamp(tracking_error_lpf_ * 10.0f, 0.0f, 1.0f);
-                    tracking_rf = 1.0f - fade * (1.0f - min_rf); 
+                    tracking_rf *= 1.0f - fade * (1.0f - min_rf);
                 }
+                tracking_rf = std::clamp(tracking_rf, 0.02f, 1.0f);
 
                 // Add tape crease disturbance (Physical V-shaped crinkle)
                 float dist_crease = std::abs(float(src_y) - crease_y);
@@ -585,6 +722,7 @@ public:
                 
                 float crease_shear = 0.0f;
                 float crease_dropout_prob = 0.0f;
+                float crease_slope = 0.0f;
                 
                 if (vp.tape_crease > 0.01f && dist_crease < 35.0f) {
                     float intensity = std::pow(1.0f - (dist_crease / 35.0f), 1.5f);
@@ -602,8 +740,22 @@ public:
                     crease_dropout_prob = intensity * vp.tape_crease * 0.6f;
                 }
 
+                if (crinkle_strength > 0.005f) {
+                    float dist_crinkle = std::abs(float(src_y) - crinkle_center_y);
+                    if (dist_crinkle > (float)H * 0.5f) dist_crinkle = float(H) - dist_crinkle;
+                    if (dist_crinkle < crinkle_band) {
+                        float ci = std::pow(1.0f - (dist_crinkle / crinkle_band), 2.2f) * crinkle_strength;
+                        float fold_wave = std::sin(float(y) * 0.18f + wallTime_ * 17.0f + crinkle_phase_rad);
+                        float notch = fold_wave > 0.0f ? 1.0f : -0.6f;
+                        crease_shear += ci * (36.0f + fold_wave * 24.0f + notch * 18.0f);
+                        crease_slope += ci * (0.4f + 0.45f * std::sin(float(y) * 0.07f + wallTime_ * 11.0f));
+                        tracking_rf *= std::max(0.03f, 1.0f - ci * 1.6f);
+                        crease_dropout_prob = std::max(crease_dropout_prob, ci * 0.8f);
+                    }
+                }
+
                 float current_h_roll = h_roll_phase_ * 0.1f;  // Reduced influence
-                float h_sync_roll = current_h_roll * float(W_TOTAL) * (target_error + vp.sync_hold_failure);
+                float h_sync_roll = current_h_roll * float(W_TOTAL) * (target_error + vp.sync_hold_failure + unlock * 1.2f);
 
                 float h_sync_shear = 0.0f;
                 if (tracking_error_lpf_ > 0.01f || vp.tape_crease > 0.01f) {
@@ -616,7 +768,7 @@ public:
                                          + std::sin(src_y * 0.47f - wallTime_ * 71.0f) * 0.25f
                                          + std::normal_distribution<float>(0, 1)(rng) * 0.6f;
                      float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
-                     h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * rf_penalty;
+                     h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * (rf_penalty + unlock * 1.4f);
                 }
 
                 float tbe_start = total_h_warp + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
@@ -643,6 +795,7 @@ public:
                 // Stretch/squash line internally: simulates tape speed variation
                 // *within* a single scanline (real VHS tape stretches under tension)
                 float tbe_slope = scrape_flutter * 0.25f;
+                tbe_slope += crease_slope;
 
                 if (dy > 0.0f && dy < 100.0f) {
                     // Huge stretch/squash during the motor snap
@@ -665,6 +818,7 @@ public:
                 //
                 // Values are in radians. Max settings produce ~1-2° phase error.
                 float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + wallTime_ * 1.2f);
+                line_wow_offset += std::normal_distribution<float>(0.0f, demag_deg * 0.05f + unlock * 0.08f)(rng);
                 float line_flutter_base = flutter_dev * 0.008f *
                     std::sin(float(y) * 0.3f + wallTime_ * 47.0f) *
                     std::normal_distribution<float>(0.0f, 1.0f)(rng);
@@ -683,9 +837,9 @@ public:
                 float dropout_x_pos = 0.0f;
 
                 // Check if a dropout event occurs this line
-                if (ep.dropout_rate > 0.005f) {
+                if (dropout_drive > 0.002f) {
                     // Probability of at least one dropout per line
-                    float line_dropout_prob = ep.dropout_rate * 0.4f;  // scale to visible
+                    float line_dropout_prob = dropout_drive * 0.4f;  // scale to visible
                     std::uniform_real_distribution<float> dropout_rng(0, 1);
                     std::uniform_real_distribution<float> duration_rng(10, 180);
                     std::uniform_real_distribution<float> pos_rng(H_BLANK + 10, H_BLANK + W - 30);
@@ -730,6 +884,16 @@ public:
                         Y = 0.299f * r + 0.587f * g + 0.114f * b;
                         I = 0.596f * r - 0.274f * g - 0.321f * b;
                         Q = 0.211f * r - 0.523f * g + 0.311f * b;
+
+                        I *= chroma_attenuation;
+                        Q *= chroma_attenuation;
+                        Y += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (luma_noise_level * 0.02f);
+                        I += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (chroma_noise_level * 0.01f);
+                        Q += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (chroma_noise_level * 0.01f);
+
+                        if (motor_defect > 0.05f) {
+                            Y += motor_rf_noise * 0.03f;
+                        }
                         
                         if (d_tail > 0.01f) {
                             // Dropout effect: high-luma 'spark' followed by darkened tail
@@ -799,11 +963,12 @@ public:
                 float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f
                                       + ep.flutter_dep * 0.15f
                                       + wow_flutter_phase_error * 0.2f;
-                if (ep.dropout_rate > 0.01f) {
-                     if (std::uniform_real_distribution<float>(0, 1)(rng) < ep.dropout_rate * 0.5f) {
-                         pll_instability += 2.0f;
-                     }
+                if (dropout_drive > 0.01f || unlock > 0.1f) {
+                     if (std::uniform_real_distribution<float>(0, 1)(rng) < dropout_drive * 0.5f) {
+                          pll_instability += 2.0f;
+                      }
                 }
+                pll_instability += unlock * 0.9f;
                 float pll_drift_accum = 0.0f;
 
                 // Demodulation variables
@@ -811,6 +976,8 @@ public:
                 const float lpfA = 0.35f;
                 const float chrA = 0.12f;
 
+                float prev_r = 0.0f, prev_g = 0.0f, prev_b = 0.0f;
+                bool has_prev = false;
                 for (int out_x = 0; out_x < W; ++out_x) {
                     int x = out_x + H_BLANK;
                     float sig = comp_line[x];
@@ -848,6 +1015,29 @@ public:
                     float g = lpY - 0.272f * si - 0.647f * sq;
                     float b = lpY - 1.106f * si + 1.703f * sq;
 
+                    float snow = std::normal_distribution<float>(0.0f, wear_noise * 0.12f)(rng);
+                    r += snow;
+                    g += snow;
+                    b += snow;
+
+                    if (wear_noise > 0.35f && std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < wear_noise * 0.03f) {
+                        float spark = std::uniform_real_distribution<float>(-0.35f, 0.55f)(rng);
+                        r += spark;
+                        g += spark;
+                        b += spark;
+                    }
+
+                    float smear = std::clamp(sticky_deg * 0.6f + age_deg * 0.4f, 0.0f, 0.85f);
+                    if (has_prev && smear > 0.001f) {
+                        r = r * (1.0f - smear) + prev_r * smear;
+                        g = g * (1.0f - smear) + prev_g * smear;
+                        b = b * (1.0f - smear) + prev_b * smear;
+                    }
+                    prev_r = r;
+                    prev_g = g;
+                    prev_b = b;
+                    has_prev = true;
+
                     dr[out_x * 3 + 0] = (uchar)std::clamp(b * 255.f, 0.f, 255.f);
                     dr[out_x * 3 + 1] = (uchar)std::clamp(g * 255.f, 0.f, 255.f);
                     dr[out_x * 3 + 2] = (uchar)std::clamp(r * 255.f, 0.f, 255.f);
@@ -881,6 +1071,14 @@ public:
             // Real VHS PLL pull-in time constant is ~3-8 scanlines.
             // Creates the classic "flagging" bend at the top of screen.
             float line_afc = afc_error_ * std::exp(-float(y) * 0.08f);  // ~30 line decay
+            float motor_top_bend = motor_top_bend_amp
+                * std::exp(-float(y) * 0.055f)
+                * (1.0f + 0.08f * std::sin(tapeTime_ * 4.0f + float(y) * 0.02f));
+            line_afc += motor_top_bend;
+            float flyback_unlock_jitter = unlock * (6.0f + age_deg * 14.0f + sticky_deg * 18.0f)
+                * std::sin(float(y) * 0.42f + wallTime_ * 91.0f);
+            float unlock_top_gate = 1.0f - std::exp(-float(y) * 0.06f);
+            line_afc += flyback_unlock_jitter * unlock_top_gate;
 
             // Guide-roller micro-bounce: impulsive spike every ~80-200 lines
             // Multiple bounce points for more chaotic behavior.
@@ -942,15 +1140,20 @@ public:
             // Tracking RF Mask
             float dist_rf = std::abs(float(src_y) - bar_y);
             if (dist_rf > (float)H / 2.0f) dist_rf = (float)H - dist_rf; 
-            float tracking_rf = 1.0f;
-            if (tracking_error_lpf_ > 0.05f && dist_rf < bar_width) {
-                tracking_rf = dist_rf / bar_width; 
+            float tracking_rf = rf_level;
+            if (dist_rf < bar_width) {
+                float min_rf = dist_rf / bar_width;
+                float fade = std::clamp(tracking_error_lpf_ * 10.0f, 0.0f, 1.0f);
+                tracking_rf *= 1.0f - fade * (1.0f - min_rf);
             }
+            tracking_rf = std::clamp(tracking_rf, 0.02f, 1.0f);
 
             // Add tape crease disturbance
             float dist_crease = std::abs(float(src_y) - crease_y);
             if (dist_crease > (float)H / 2.0f) dist_crease = (float)H - dist_crease;
             float crease_shear = 0.0f;
+            float crease_dropout_prob = 0.0f;
+            float crease_slope = 0.0f;
             if (vp.tape_crease > 0.01f && dist_crease < 15.0f) {
                 // High-frequency chaotic oscillation simulates crease
                 // "catching" on the head edge during playback
@@ -958,10 +1161,25 @@ public:
                                  + std::cos(float(y) * 0.5f - wallTime_ * 43.0f) * 8.0f;
                 crease_shear = (1.0f - dist_crease / 15.0f) * vp.tape_crease * (50.0f + shear_wave);
                 tracking_rf *= std::max(0.1f, 1.0f - vp.tape_crease * (1.0f - dist_crease/15.0f));
+                crease_dropout_prob = std::max(crease_dropout_prob, (1.0f - dist_crease / 15.0f) * vp.tape_crease * 0.65f);
+            }
+
+            if (crinkle_strength > 0.005f) {
+                float dist_crinkle = std::abs(float(src_y) - crinkle_center_y);
+                if (dist_crinkle > (float)H * 0.5f) dist_crinkle = float(H) - dist_crinkle;
+                if (dist_crinkle < crinkle_band) {
+                    float ci = std::pow(1.0f - (dist_crinkle / crinkle_band), 2.2f) * crinkle_strength;
+                    float fold_wave = std::sin(float(y) * 0.18f + wallTime_ * 17.0f + crinkle_phase_rad);
+                    float notch = fold_wave > 0.0f ? 1.0f : -0.6f;
+                    crease_shear += ci * (36.0f + fold_wave * 24.0f + notch * 18.0f);
+                    crease_slope += ci * (0.4f + 0.45f * std::sin(float(y) * 0.07f + wallTime_ * 11.0f));
+                    tracking_rf *= std::max(0.03f, 1.0f - ci * 1.6f);
+                    crease_dropout_prob = std::max(crease_dropout_prob, ci * 0.8f);
+                }
             }
 
             float current_h_roll = h_roll_phase_ * 0.1f;  // Reduced influence
-            float h_sync_roll = current_h_roll * float(W_TOTAL) * (tracking_error_lpf_ + vp.sync_hold_failure);
+            float h_sync_roll = current_h_roll * float(W_TOTAL) * (tracking_error_lpf_ + vp.sync_hold_failure + unlock * 1.2f);
 
             float h_sync_shear = 0.0f;
             if (tracking_error_lpf_ > 0.01f || vp.tape_crease > 0.01f) {
@@ -972,7 +1190,7 @@ public:
                                      + std::sin(src_y * 0.47f - wallTime_ * 71.0f) * 0.25f
                                      + std::normal_distribution<float>(0, 1)(rng) * 0.6f;
                  float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
-                 h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * rf_penalty;
+                 h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * (rf_penalty + unlock * 1.4f);
             }
 
             float tbe_start = total_h_warp + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
@@ -987,6 +1205,7 @@ public:
             // Stretch/squash line internally: simulates tape speed variation
             // *within* a single scanline (real VHS tape stretches under tension)
             float tbe_slope = scrape_flutter * 0.25f;
+            tbe_slope += crease_slope;
             if (dy > 0.0f && dy < 100.0f) {
                 // Huge stretch/squash during the motor snap
                 tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 25.0f);
@@ -997,6 +1216,7 @@ public:
             // Per-line wow offset for single-threaded path
             // Very subtle: max 1-2° phase error at max settings
             float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + wallTime_ * 1.2f);
+            line_wow_offset += std::normal_distribution<float>(0.0f, demag_deg * 0.05f + unlock * 0.08f)(rng);
             float line_flutter_base = flutter_dev * 0.008f *
                 std::sin(float(y) * 0.3f + wallTime_ * 47.0f) *
                 std::normal_distribution<float>(0.0f, 1.0f)(rng);
@@ -1006,8 +1226,8 @@ public:
             float dropout_active = false;
             float dropout_duration = 0.0f;
             float dropout_x_pos = 0.0f;
-            if (ep.dropout_rate > 0.005f) {
-                float line_dropout_prob = ep.dropout_rate * 0.4f;
+            if (dropout_drive > 0.002f) {
+                float line_dropout_prob = dropout_drive * 0.4f;
                 std::uniform_real_distribution<float> dropout_rng(0, 1);
                 std::uniform_real_distribution<float> duration_rng(10, 180);
                 std::uniform_real_distribution<float> pos_rng(H_BLANK + 10, H_BLANK + W - 30);
@@ -1042,6 +1262,16 @@ public:
                     Y = 0.299f * r + 0.587f * g + 0.114f * b;
                     I = 0.596f * r - 0.274f * g - 0.321f * b;
                     Q = 0.211f * r - 0.523f * g + 0.311f * b;
+
+                    I *= chroma_attenuation;
+                    Q *= chroma_attenuation;
+                    Y += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (luma_noise_level * 0.02f);
+                    I += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (chroma_noise_level * 0.01f);
+                    Q += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (chroma_noise_level * 0.01f);
+
+                    if (motor_defect > 0.05f) {
+                        Y += motor_rf_noise * 0.03f;
+                    }
                 }
                 if (tracking_rf < 0.95f && xSrc >= H_BLANK) {
                      float noise_thresh = tracking_rf * tracking_rf;
@@ -1049,6 +1279,14 @@ public:
                           Y = std::uniform_real_distribution<float>(-0.2f, 1.0f)(rng);
                           I = 0.0f; Q = 0.0f; // Pure uncolored noise
                      }
+                }
+
+                if (crease_dropout_prob > 0.001f && xSrc >= H_BLANK) {
+                    if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.045f) {
+                        Y = -0.12f + std::uniform_real_distribution<float>(0.0f, 0.18f)(rng);
+                        I *= 0.2f;
+                        Q *= 0.2f;
+                    }
                 }
 
                 // Oxide dropout: signal goes to black/static
@@ -1090,11 +1328,12 @@ public:
             float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f
                                   + ep.flutter_dep * 0.15f
                                   + wow_flutter_phase_error * 0.2f;
-            if (ep.dropout_rate > 0.01f) {
-                 if (std::uniform_real_distribution<float>(0, 1)(rng) < ep.dropout_rate * 0.5f) {
+            if (dropout_drive > 0.01f || unlock > 0.1f) {
+                 if (std::uniform_real_distribution<float>(0, 1)(rng) < dropout_drive * 0.5f) {
                      pll_instability += 2.0f;
                  }
             }
+            pll_instability += unlock * 0.9f;
             float pll_drift_accum = 0.0f;
 
             // Demodulation variables
@@ -1102,6 +1341,8 @@ public:
             const float lpfA = 0.35f;
             const float chrA = 0.12f;
 
+            float prev_r = 0.0f, prev_g = 0.0f, prev_b = 0.0f;
+            bool has_prev = false;
             for (int out_x = 0; out_x < W; ++out_x) {
                 int x = out_x + H_BLANK;
                 float sig = comp_line[x];
@@ -1133,6 +1374,29 @@ public:
                 float r = lpY + 0.956f * si + 0.621f * sq;
                 float g = lpY - 0.272f * si - 0.647f * sq;
                 float b = lpY - 1.106f * si + 1.703f * sq;
+
+                float snow = std::normal_distribution<float>(0.0f, wear_noise * 0.12f)(rng);
+                r += snow;
+                g += snow;
+                b += snow;
+
+                if (wear_noise > 0.35f && std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < wear_noise * 0.03f) {
+                    float spark = std::uniform_real_distribution<float>(-0.35f, 0.55f)(rng);
+                    r += spark;
+                    g += spark;
+                    b += spark;
+                }
+
+                float smear = std::clamp(sticky_deg * 0.6f + age_deg * 0.4f, 0.0f, 0.85f);
+                if (has_prev && smear > 0.001f) {
+                    r = r * (1.0f - smear) + prev_r * smear;
+                    g = g * (1.0f - smear) + prev_g * smear;
+                    b = b * (1.0f - smear) + prev_b * smear;
+                }
+                prev_r = r;
+                prev_g = g;
+                prev_b = b;
+                has_prev = true;
 
                 dr[out_x * 3 + 0] = (uchar)std::clamp(b * 255.f, 0.f, 255.f);
                 dr[out_x * 3 + 1] = (uchar)std::clamp(g * 255.f, 0.f, 255.f);
@@ -1609,6 +1873,9 @@ struct AppState {
     void setParam(std::function<void(EngineParams&)> fn){
         fn(baseParams);
     }
+    void setParamVideo(std::function<void(EngineParams&,VideoParams&)> fn){
+        fn(baseParams, videoParams);
+    }
 };
 
 void startGlobalAudioCapture(AppState& app, const std::string& path) {
@@ -2014,7 +2281,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     ImGui::EndChild();ImGui::SameLine();
 
     // ─── COL 2: VIDEO PROCESSING ─────────────────────────────
-    ImGui::BeginChild("##c2",{colW,ctrlH-4},true);
+    ImGui::BeginChild("##c2",{colW,ctrlH-4},true,ImGuiWindowFlags_AlwaysVerticalScrollbar);
     sectionHdr("VIDEO PROCESSING");
     ImGui::Checkbox("NTSC/VHS SIMULATION",&app.ntscEnabled);
     {std::lock_guard<std::mutex> lk(app.pp.mu);app.pp.ntscEnabled=app.ntscEnabled;}
@@ -2029,37 +2296,62 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         app.baseParams.ips_base = kIPS[app.tapeSpeedIdx];
         std::lock_guard<std::mutex> lk(app.pp.mu);app.pp.spdIdx=app.tapeSpeedIdx;
     }
-    { std::lock_guard<std::mutex> a_lk(app.audioMu);
-    if(app.tapeEngine){
-        bool tCh=false;
-        auto sl3=[&](const char*n,float*v,float lo,float hi){
-            ImGui::SetNextItemWidth(colW-130);tCh|=ImGui::SliderFloat(n,v,lo,hi);};
-        EngineParams& bp=app.baseParams;
-        sectionHdr("TRANSPORT");
-        sl3("WOW",&bp.wow_dep,0,5);
-        sl3("FLUTTER",&bp.flutter_dep,0,1);
-        bp.flutter_dep = std::max(bp.flutter_dep, 0.001f); // floor to avoid pathological zero
-        sl3("MOTOR DEGRADE",&bp.motor_health,0,1);
-        sl3("MOTOR DRAG",&bp.motor_drag,0,.9f);
-        sl3("DROPOUT",&bp.dropout_rate,0,.1f);
-        sectionHdr("ELECTRONICS & NOISE");
-        sl3("TAPE HISS",&bp.hiss,0,.02f);
-        sl3("HISS COLOR",&bp.hiss_color,0,1);
-        sl3("MAINS HUM",&bp.mains_hum,0,.05f);
-        sl3("HEAD BUMP",&bp.head_bump,0,1);
-        sl3("HF CUTOFF",&bp.cutoff_base,1000,20000);
-        {
-            std::lock_guard<std::mutex> lk2(app.pp.mu);
-            bp.tracking_error = app.videoParams.tracking_error; // Link to audio engine
-            app.pp.epSnap=bp;app.pp.tapeSpd=bp.tape_speed_mult;app.pp.engValid.store(true);
-        }
-
-        float vL=0, vR=0;
+    bool hasTapeEngine = false;
+    float vL = 0.f, vR = 0.f;
+    {
+        std::lock_guard<std::mutex> a_lk(app.audioMu);
+        hasTapeEngine = app.tapeEngine != nullptr;
         if(app.audioIO){ vL=app.audioIO->get_level_left(); vR=app.audioIO->get_level_right(); }
-        app.vuL = vL; app.vuR = vR;
-    }else{ImGui::Spacing();ImGui::TextColored({.9f,.3f,.3f,1.f},"Load video file to enable tape DSP");}
     }
-    
+
+    bool tCh=false;
+    auto sl3=[&](const char*n,float*v,float lo,float hi){
+        ImGui::SetNextItemWidth(colW-130);tCh|=ImGui::SliderFloat(n,v,lo,hi);};
+    EngineParams& bp=app.baseParams;
+
+    if(!hasTapeEngine){ImGui::Spacing();ImGui::TextColored({.9f,.3f,.3f,1.f},"Load video file to enable tape DSP");}
+
+    sectionHdr("TRANSPORT");
+    ImGui::BeginDisabled(!hasTapeEngine);
+    sl3("WOW",&bp.wow_dep,0,5);
+    sl3("FLUTTER",&bp.flutter_dep,0,1);
+    bp.flutter_dep = std::max(bp.flutter_dep, 0.001f); // floor to avoid pathological zero
+    sl3("MOTOR DEGRADE",&app.videoParams.motor_health,0,1);
+    sl3("MOTOR DRAG",&bp.motor_drag,0,.9f);
+    ImGui::EndDisabled();
+
+    sectionHdr("TAPE DAMAGE");
+    ImGui::BeginDisabled(!hasTapeEngine);
+    sl3("TRACKING ERROR",&app.videoParams.tracking_error,0,1);
+    sl3("SYNC HOLD FAIL",&app.videoParams.sync_hold_failure,0,1);
+    sl3("TAPE CRINKLE",&app.videoParams.tape_crease,0,1);
+    sl3("DROPOUT",&app.videoParams.dropout_rate,0,.1f);
+    sl3("TAPE OXIDE",&app.videoParams.oxide_shedding,0,1);
+    sl3("DEMAGNET",&app.videoParams.demagnetization,0,1);
+    sl3("STICKY SHED",&app.videoParams.sticky_shed,0,.2f);
+    sl3("TAPE AGE",&app.videoParams.tape_age,0,1);
+    ImGui::EndDisabled();
+
+    sectionHdr("ELECTRONICS & NOISE");
+    ImGui::BeginDisabled(!hasTapeEngine);
+    sl3("TAPE HISS",&bp.hiss,0,.02f);
+    sl3("HISS COLOR",&bp.hiss_color,0,1);
+    sl3("MAINS HUM",&bp.mains_hum,0,.05f);
+    sl3("HEAD BUMP",&bp.head_bump,0,1);
+    sl3("HF CUTOFF",&bp.cutoff_base,1000,20000);
+    ImGui::EndDisabled();
+
+    {
+        std::lock_guard<std::mutex> lk2(app.pp.mu);
+        bp.tracking_error = app.videoParams.tracking_error; // Link to audio engine
+        app.pp.epSnap=bp;
+        app.pp.vpSnap=app.videoParams;
+        app.pp.tapeSpd=bp.tape_speed_mult;
+        app.pp.engValid.store(hasTapeEngine);
+    }
+
+    app.vuL = vL; app.vuR = vR;
+
     // Cleanup old audio files if they accumulate?
     // Let's do a simple cleanup on switch in stopAudioAndClear instead.
     if(!app.audioWavPath.empty()){
@@ -2073,24 +2365,23 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     // ─── COL 3: PRESETS + METERS ─────────────────────────────
     ImGui::BeginChild("##c3",{colW,ctrlH-4},true);
     sectionHdr("TAPE PRESETS");
-    struct PR{const char*n;std::function<void(EngineParams&)>fn;};
+    struct PR{const char*n;std::function<void(EngineParams&,VideoParams&)>fn;};
     static const PR prs[]={
-        {"CLEAN DIGITAL",[](EngineParams&p){p={};p.ips_base=15;p.cutoff_base=20000;}},
-        {"VHS  SP",      [](EngineParams&p){p={};p.ips_base=15;p.wow_dep=.5f;p.flutter_dep=.15f;p.head_bump=.4f;p.cutoff_base=12000;p.hiss=.003f;}},
-        {"VHS  LP",      [](EngineParams&p){p={};p.ips_base=7.5f;p.wow_dep=1.5f;p.flutter_dep=.3f;p.head_bump=.6f;p.cutoff_base=8000;p.hiss=.006f;p.hiss_color=.15f;}},
-        {"VHS  EP",      [](EngineParams&p){p={};p.ips_base=3.75f;p.wow_dep=3.f;p.flutter_dep=.6f;p.motor_health=.6f;p.head_bump=.8f;p.cutoff_base=5000;p.hiss=.01f;p.hiss_color=.25f;p.demagnetization=.4f;p.print_through=.2f;}},
-        {"WORN  EP",     [](EngineParams&p){p={};p.ips_base=3.75f;p.wow_dep=4.f;p.flutter_dep=.8f;p.motor_health=.75f;p.sticky_shed=.08f;p.dropout_rate=.05f;p.demagnetization=.7f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.35f;p.mains_hum=.015f;}},
-        {"DEGRADED",     [](EngineParams&p){p={};p.ips_base=7.5f;p.wow_dep=4.f;p.flutter_dep=.8f;p.motor_health=.8f;p.sticky_shed=.08f;p.oxide_shedding=.3f;p.dropout_rate=.05f;p.demagnetization=.7f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.3f;p.mains_hum=.025f;}},
+        {"CLEAN DIGITAL",[](EngineParams&p,VideoParams&v){p={};p.ips_base=15;p.cutoff_base=20000;v={};}},
+        {"VHS  SP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=15;p.wow_dep=.5f;p.flutter_dep=.15f;p.head_bump=.4f;p.cutoff_base=12000;p.hiss=.003f;v={};}},
+        {"VHS  LP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=7.5f;p.wow_dep=1.5f;p.flutter_dep=.3f;p.head_bump=.6f;p.cutoff_base=8000;p.hiss=.006f;p.hiss_color=.15f;v={};}},
+        {"VHS  EP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=3.75f;p.wow_dep=3.f;p.flutter_dep=.6f;p.head_bump=.8f;p.cutoff_base=5000;p.hiss=.01f;p.hiss_color=.25f;v={};v.demagnetization=.4f;v.motor_health=.6f;}},
+        {"WORN  EP",     [](EngineParams&p,VideoParams&v){p={};p.ips_base=3.75f;p.wow_dep=4.f;p.flutter_dep=.8f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.35f;p.mains_hum=.015f;v={};v.sticky_shed=.08f;v.dropout_rate=.05f;v.demagnetization=.7f;v.motor_health=.75f;}},
+        {"DEGRADED",     [](EngineParams&p,VideoParams&v){p={};p.ips_base=7.5f;p.wow_dep=4.f;p.flutter_dep=.8f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.3f;p.mains_hum=.025f;v={};v.sticky_shed=.08f;v.dropout_rate=.05f;v.demagnetization=.7f;v.motor_health=.8f;v.oxide_shedding=.3f;}},
     };
     for(auto&pr:prs){
         if(ImGui::Button(pr.n,{colW-18,0})){
-            app.setParam(pr.fn);
-            std::lock_guard<std::mutex> lk2(app.pp.mu);app.pp.epSnap=app.baseParams;app.pp.tapeSpd=app.baseParams.tape_speed_mult;app.pp.engValid.store(true);}}
+            app.setParamVideo(pr.fn);
+            std::lock_guard<std::mutex> lk2(app.pp.mu);app.pp.epSnap=app.baseParams;app.pp.vpSnap=app.videoParams;app.pp.tapeSpd=app.baseParams.tape_speed_mult;app.pp.engValid.store(true);}}
     
     sectionHdr("AUDIO METERS");
     ImGui::Text("L:"); ImGui::SameLine(); vuBar(app.vuL,colW-46,10,app.vuL>.95f);
     ImGui::Text("R:"); ImGui::SameLine(); vuBar(app.vuR,colW-46,10,app.vuR>.95f);
-    
     sectionHdr("RENDER EXPORT");
     static int fmtIdx = 0;
     const char* fmts[] = {"MP4 (H.264 Lossy)", "MKV (FFV1 Lossless)", "AVI (FFV1 Lossless)"};
@@ -2262,6 +2553,7 @@ int main(int,char**){
 
             std::lock_guard<std::mutex> lk2(app.pp.mu);
             app.pp.epSnap=app.baseParams;
+            app.pp.vpSnap=app.videoParams;
             app.pp.tapeSpd=app.baseParams.tape_speed_mult;
             app.pp.engValid.store(true);
             
@@ -2364,13 +2656,31 @@ int main(int,char**){
          std::lock_guard<std::mutex> a_lk(app.audioMu);
          if(app.tapeEngine&&app.audioIO&&app.audioIO->is_open()){
              EngineParams active = app.baseParams;
+             float tracking_deg = std::clamp(app.videoParams.tracking_error, 0.0f, 1.0f);
+             float dropout_deg = std::clamp(app.videoParams.dropout_rate * 10.0f, 0.0f, 1.0f);
+             float motor_deg = std::clamp(app.videoParams.motor_health, 0.0f, 1.0f);
+             float crease_deg = std::clamp(app.videoParams.tape_crease, 0.0f, 1.0f);
+             float oxide_deg = std::clamp(app.videoParams.oxide_shedding, 0.0f, 1.0f);
+             float demag_deg = std::clamp(app.videoParams.demagnetization, 0.0f, 1.0f);
+             float sticky_deg = std::clamp(app.videoParams.sticky_shed, 0.0f, 1.0f);
+             float age_deg = std::clamp(app.videoParams.tape_age, 0.0f, 1.0f);
+
+             active.dropout_rate = std::max(active.dropout_rate, app.videoParams.dropout_rate);
+             active.motor_health = std::max(active.motor_health, app.videoParams.motor_health);
+             active.oxide_shedding = std::max(active.oxide_shedding, app.videoParams.oxide_shedding);
+             active.demagnetization = std::max(active.demagnetization, app.videoParams.demagnetization);
+             active.sticky_shed = std::max(active.sticky_shed, app.videoParams.sticky_shed);
              // ─── Diegetic HiFi Loss ───────────────────────────────────────
              // Compute signal quality from video-relevant parameters only
              // (dropout_rate, tracking_error are the user-controllable ones
              // that actually affect the rendered image)
              float signal_loss = std::clamp(
-                 app.baseParams.dropout_rate * 4.0f
-                 + (app.videoParams.tracking_error * 2.0f),
+                 tracking_deg * 0.6f
+                 + dropout_deg * 0.3f
+                 + oxide_deg * 0.4f
+                 + crease_deg * 0.5f
+                 + sticky_deg * 0.3f
+                 + age_deg * 0.3f,
                  0.0f, 1.0f);
              static float hifi_blend_lpf = 0.0f;
              hifi_blend_lpf += (signal_loss - hifi_blend_lpf) * 0.04f;
@@ -2398,7 +2708,7 @@ int main(int,char**){
                  active.cutoff_base = std::min(active.cutoff_base, linear_cutoff);
                  active.hiss += t * 0.010f;
              }
-             float trk = app.videoParams.tracking_error;
+             float trk = tracking_deg;
              if (trk > 0.05f) {
                  active.hiss += trk * 0.015f; 
                  active.cutoff_base *= std::max(0.02f, 1.0f - trk * 0.95f);
@@ -2406,7 +2716,7 @@ int main(int,char**){
                  // Cap tracking dropout to avoid flooding CapstanVar's scheduler
                  active.dropout_rate = std::min(active.dropout_rate + trk * 0.05f, 0.09f);
              }
-             float crease = app.videoParams.tape_crease;
+             float crease = crease_deg;
              if (crease > 0.01f) {
                  float t_sec = (float)g_audioSamplePos.load() / AUDIO_SR;
                  float cp = std::fmod(t_sec * 0.1f, 1.0f);
@@ -2418,12 +2728,67 @@ int main(int,char**){
 
              // Motor degradation affects audio: bad motor causes wow/flutter
              // plus additional artifacts like dropouts and pitch instability
-             float motor_defect = std::clamp(app.baseParams.motor_health, 0.0f, 1.0f);
+             float motor_defect = motor_deg;
              if (motor_defect > 0.05f) {
-                 active.wow_dep += motor_defect * 3.0f;     // Bad motor = slow wow
-                 active.flutter_dep += motor_defect * 0.5f;  // Bad motor = fast flutter
-                 active.dropout_rate += motor_defect * 0.03f; // Motor cogging causes dropouts
-             }
+                  active.wow_dep += motor_defect * 3.0f;     // Bad motor = slow wow
+                  active.flutter_dep += motor_defect * 0.5f;  // Bad motor = fast flutter
+                  active.dropout_rate += motor_defect * 0.03f; // Motor cogging causes dropouts
+              }
+
+              if (sticky_deg > 0.01f) {
+                  active.cutoff_base *= std::max(0.1f, 1.0f - sticky_deg * 0.7f);
+                  active.hiss += sticky_deg * 0.008f;
+              }
+
+              if (demag_deg > 0.01f) {
+                  active.print_through += demag_deg * 0.3f;
+                  active.hiss += demag_deg * 0.005f;
+              }
+
+              // Parameter de-click guard for external audio library.
+              // Smooth fast UI jumps to avoid zipper noise, crackle, and sudden dropouts.
+              {
+                  float param_dt = std::clamp((float)dt, 0.0f, 0.1f);
+                  static bool audio_slew_init = false;
+                  static float s_wow = 0.0f;
+                  static float s_flutter = 0.0f;
+                  static float s_motor_drag = 0.0f;
+                  static float s_dropout = 0.0f;
+                  static float s_hiss = 0.0f;
+                  static float s_hiss_color = 0.0f;
+                  static float s_cutoff = 0.0f;
+                  static float s_print = 0.0f;
+                  static float s_azimuth = 0.0f;
+
+                  auto slew = [param_dt](float& state, float target, float hz) {
+                      float a = 1.0f - std::exp(-param_dt * hz);
+                      state += (target - state) * a;
+                      return state;
+                  };
+
+                  if (!audio_slew_init || app.tapeEngine->play_head < 128) {
+                      s_wow = active.wow_dep;
+                      s_flutter = active.flutter_dep;
+                      s_motor_drag = active.motor_drag;
+                      s_dropout = active.dropout_rate;
+                      s_hiss = active.hiss;
+                      s_hiss_color = active.hiss_color;
+                      s_cutoff = active.cutoff_base;
+                      s_print = active.print_through;
+                      s_azimuth = active.azimuth_drift;
+                      audio_slew_init = true;
+                  }
+
+                  active.wow_dep = slew(s_wow, active.wow_dep, 4.5f);
+                  active.flutter_dep = slew(s_flutter, active.flutter_dep, 5.5f);
+                  active.motor_drag = slew(s_motor_drag, active.motor_drag, 3.0f);
+                  active.dropout_rate = slew(s_dropout, active.dropout_rate, 2.0f);
+                  active.hiss = slew(s_hiss, active.hiss, 8.0f);
+                  active.hiss_color = slew(s_hiss_color, active.hiss_color, 7.0f);
+                  active.cutoff_base = slew(s_cutoff, active.cutoff_base, 6.0f);
+                  active.print_through = slew(s_print, active.print_through, 5.0f);
+                  active.azimuth_drift = slew(s_azimuth, active.azimuth_drift, 4.0f);
+              }
 
              float spd=1.f;
              {std::lock_guard<std::mutex> lk(app.tapeEngine->lock);
