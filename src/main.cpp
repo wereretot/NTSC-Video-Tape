@@ -243,6 +243,15 @@ public:
     float mechanical_wow_ = 0.0f;
     float mechanical_flutter_ = 0.0f;
     float afc_error_ = 0.0f;
+
+    // ── Persistent wow/flutter oscillator state ──────────────
+    // Real tape wow/flutter is a continuous time-varying speed
+    // error that frequency-modulates the NTSC subcarrier.
+    // We use multiple sinusoidal oscillators at different rates
+    // to simulate capstan roller eccentricity, reel irregularity,
+    // and mechanical resonances.
+    float wow_phase_[3]   = {0.0f, 0.0f, 0.0f};   // 0.3 Hz, 0.8 Hz, 2.1 Hz
+    float flutter_phase_[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // 15, 23, 30, 46, 67 Hz
     void initBuffers(int w, int h) {
         W_ = w;
         H_BLANK = 144;
@@ -262,6 +271,46 @@ public:
 
         // Field phase: NTSC fields at 59.94 Hz
         const float fPhase = std::fmod(wallTime_ * (kNTSC_FPS * 2.f), 4.f) * (kPI * 0.5f);
+
+        // ── WOW/FLUTTER OSCILLATORS — time-varying tape speed modulation ──
+        // Real VHS wow/flutter is a continuous time-varying speed error.
+        // This frequency-modulates the NTSC 3.58 MHz subcarrier, creating
+        // the characteristic color hue drift and chroma phase errors.
+        //
+        // Wow: slow speed variation (0.3-2 Hz) from capstan roller
+        //      eccentricity and reel irregularities
+        // Flutter: fast speed variation (15-67 Hz) from mechanical
+        //      resonances, guide rollers, tape tension modes
+        //
+        static constexpr float WOW_HZ[]    = {0.3f, 0.8f, 2.1f};
+        static constexpr float FLUTTER_HZ[] = {15.0f, 23.0f, 30.0f, 46.0f, 67.0f};
+        static constexpr float WOW_AMP[]   = {0.5f, 0.3f, 0.2f};     // relative weights
+        static constexpr float FLUTTER_AMP[] = {0.25f, 0.20f, 0.20f, 0.18f, 0.17f};
+
+        float wow_sum = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            wow_phase_[i] = std::fmod(wow_phase_[i] + wallDt * WOW_HZ[i], 1.0f);
+            wow_sum += WOW_AMP[i] * std::sin(wow_phase_[i] * 2.0f * kPI);
+        }
+
+        float flutter_sum = 0.0f;
+        for (int i = 0; i < 5; ++i) {
+            flutter_phase_[i] = std::fmod(flutter_phase_[i] + wallDt * FLUTTER_HZ[i], 1.0f);
+            flutter_sum += FLUTTER_AMP[i] * std::sin(flutter_phase_[i] * 2.0f * kPI);
+        }
+
+        // Scale by user settings: wow_dep (0-5) and flutter_dep (0-1)
+        // Realistic VHS wow is ±0.5-3% speed variation, flutter is ±0.1-0.5%
+        float wow_dev = wow_sum * ep.wow_dep * 0.01f;        // up to ±5% at max
+        float flutter_dev = flutter_sum * ep.flutter_dep * 0.008f;  // up to ±0.8% at max
+
+        // Note: Real VHS does NOT accumulate subcarrier phase error frame-to-frame.
+        // The VCR re-generates the color burst at a clean reference every field,
+        // and the TV's color PLL locks to that burst. Residual chroma errors come
+        // from tiny per-line phase offsets (mechanical tape bounce) and very
+        // subtle within-line flutter noise. These are subtle — VHS color quality
+        // is dominated by overall hue offset (the TBC HUE knob), not rainbowing.
+        // The per-line offsets are applied in the scanline processing loop below.
 
         // --- V-SYNC LOSS (Rolling) & TAPE SPEED ERROR ---
         float speed_error = std::abs(1.0f - instantSpd);
@@ -323,6 +372,47 @@ public:
         float safeTapeSpd = std::max(tapeSpd, 0.001f);
         float speed_dev = std::abs(instantSpd - safeTapeSpd) / safeTapeSpd;
 
+        // --- MOTOR DEGRADATION ARTIFACTS ----------------------------------
+        // motor_health = 0.0 means no motor defects. motor_health = 1.0 means
+        // worst motor degradation (cogging, belt slip, drum wobble, vibration).
+        // A bad motor in a VCR causes unique artifacts that are NOT wow/flutter:
+        //   1. Cogging: discrete stepping at rotor notch positions
+        //   2. Belt slip: rubber degrades, slips at the same point per rev
+        //   3. Drum wobble: bearing wear transmits vibration to tape path
+        //   4. Speed surges: motor can't maintain constant RPM
+        // These get WORSE as motor_health approaches 1.0 (fully degraded).
+        float motor_defect = std::clamp(ep.motor_health, 0.0f, 1.0f);
+
+        // Motor cogging: discrete "notches" as the rotor passes each pole.
+        // Creates a staircase-like horizontal displacement that jumps every
+        // few milliseconds. The capstan motor has ~8-12 poles.
+        float motor_cog = 0.0f;
+        if (motor_defect > 0.05f) {
+            float cog_hz = 3.7f;  // ~222 RPM capstan motor
+            float cog_phase = std::fmod(tapeTime_ * cog_hz, 1.0f);
+            float pole_frac = std::fmod(cog_phase * 8.0f, 1.0f);
+            // Sharp catch, slow release
+            motor_cog = std::pow(pole_frac, 0.3f) * motor_defect * 8.0f;
+        }
+
+        // Drum wobble: bearing wear causes the rotating drum to vibrate.
+        // This creates per-line horizontal jitter that varies with drum
+        // position. The drum spins at 1800 RPM (30 rev/sec for NTSC).
+        float drum_wobble_phase = 0.0f;
+        if (motor_defect > 0.05f) {
+            drum_wobble_phase = std::fmod(tapeTime_ * 30.0f, 1.0f) * 2.0f * kPI;
+        }
+
+        // Motor vibration: broadband mechanical noise transmitted to tape path
+        // Creates fine horizontal "hash" or "fizz" on every scanline
+        float motor_vibration = 0.0f;
+        if (motor_defect > 0.05f) {
+            float motor_rpm_hz = 1800.0f / 60.0f;  // 30 Hz for capstan
+            motor_vibration = motor_defect * 2.0f * (
+                std::sin(tapeTime_ * motor_rpm_hz * 2.0f * kPI) * 0.6f +
+                std::sin(tapeTime_ * motor_rpm_hz * 4.0f * kPI) * 0.3f);
+        }
+
         // Fast timebase error: high-frequency jitter from tape scraping
         // past heads. Realistic VHS TBE is 1-15 pixels peak-to-peak
         // under tracking error, with impulsive spikes up to 40 px.
@@ -350,7 +440,17 @@ public:
         // AFC error: the TV's PLL trying to catch the line sync.
         // Strong at the top of screen, decays through the field.
         // Real VCR AFC has pull-in range of ~±500 Hz, time constant ~3-8 lines.
-        afc_error_ = mechanical_wow_ * 0.4f + (speed_dev * 400.0f) + fast_tbe + tape_tension_impulse;
+        //
+        // The wow/flutter create TBE through the bend_fraction mechanism in the
+        // scanline loop (which creates proper exponential bending). The AFC
+        // error here provides the baseline tracking instability from speed error
+        // and tape tension events. MOTOR DEGRADATION adds cogging and vibration.
+        afc_error_ = mechanical_wow_ * 0.4f
+                   + (speed_dev * 400.0f)
+                   + fast_tbe
+                   + tape_tension_impulse
+                   + motor_cog * 50.0f        // motor cogging: up to +400px TBE at worst
+                   + motor_vibration * 15.0f;  // motor vibration: up to +30px hash
 
         // --- Tape Crease phase ---
         float crease_y = std::fmod(tapeTime_ * 0.1f, 1.0f) * float(H);
@@ -385,7 +485,8 @@ public:
                 // AFC Pull-in: Error decays exponentially as TV catches sync.
                 // Real VHS PLL pull-in time constant is ~3-8 scanlines.
                 // Creates the classic "flagging" bend at the top of screen.
-                float line_afc = afc_error_ * std::exp(-float(y) * 0.125f);  // ~8 line decay
+                // The bending extends ~20-30 lines down from the top.
+                float line_afc = afc_error_ * std::exp(-float(y) * 0.08f);  // ~30 line decay
 
                 // Guide-roller micro-bounce: impulsive spike every ~80-200 lines
                 // caused by tape physically bouncing off guide rollers.
@@ -407,9 +508,13 @@ public:
                 // Add the immediate physical jitter to the AFC baseline
                 float total_h_warp = line_afc + mechanical_wow_ + scrape_flutter + guide_bounce;
 
-                // --- B. Motor Drag & Belt Slips (Mid-screen AFC Snapping) ---
-                float drag_hz = 0.5f + ep.motor_health * 2.0f;
-                // Locate the 'snap' point vertically based on phase
+                // --- B. Motor Degradation: Drag, Belt Slips, Drum Wobble ---
+                // These are the VISIBLE motor artifacts that get worse as
+                // motor_health decreases. Each creates a different TBE pattern:
+
+                // Motor drag: belt slip creates a moving horizontal "bite"
+                // through the image. The slip point moves at the belt rev rate.
+                float drag_hz = 0.5f + ep.motor_drag * 2.0f;
                 float drag_phase = std::fmod(tapeTime_ * drag_hz, 1.0f) * H;
                 float dy = float(y) - drag_phase;
                 float beltSlip = 0.0f;
@@ -418,16 +523,48 @@ public:
                     beltSlip = std::exp(-dy * 0.05f) * std::sin(dy * 0.2f) * (ep.motor_drag * 20.0f);
                 }
 
+                // Add motor defect artifacts to the per-line TBE:
+                // Motor belt slip creates a visible "bite" through the image
+                // at the belt revolution point. This is a LOCAL distortion,
+                // not a global shift — only lines near the slip point are affected.
+                // The beltSlip variable already handles this in the drag section above.
+
+                // Drum wobble: per-line jitter at drum rotation frequency
+                // (1800 RPM = 30 rev/sec, so each line at a different drum position)
+                // This is SUBTLE — bearing wear creates fine jitter, not large shifts.
+                float drum_wobble_tbe = 0.0f;
+                if (motor_defect > 0.05f) {
+                    float drum_wobble_amp = motor_defect * 1.5f;  // Max ±1.5px
+                    drum_wobble_tbe = drum_wobble_amp * std::sin(drum_wobble_phase + float(y) * 0.05f);
+                }
+
+                // Add motor artifacts to the total horizontal warp
+                total_h_warp += drum_wobble_tbe;
+
                 // --- D. Head Switch Noise (VHS Tearing at bottom of VBI) ---
+                // Motor degradation makes head switching unstable because
+                // the drum speed varies. This causes the VBI tear to wander
+                // and become more violent.
                 float hsTearing = 0.0f;
-                // Raised boundary (24 lines) to ensure visibility above overscan
-                if (y >= H - 24) {
-                    float hsDepth = (float(y) - (H - 24)) / 24.0f;
-                    // Exponential "Hook" characteristic of AFC failing at the switch
-                    // Exaggerated gain (35.0) and power curve (3.5)
-                    hsTearing = std::pow(hsDepth, 3.5f) * 35.0f;
+                // Bad motors shift the head switch point vertically
+                float hs_line_offset = motor_defect * 12.0f *
+                    std::sin(tapeTime_ * 1.5f * 2.0f * kPI);
+                int hs_start = std::max(0, H - 24 + int(hs_line_offset));
+                if (y >= hs_start) {
+                    float hsDepth = (float(y) - float(hs_start)) / 24.0f;
+                    // Bad motors make the head switch more violent
+                    float hs_gain = 35.0f + motor_defect * 25.0f;
+                    hsTearing = std::pow(hsDepth, 3.5f) * hs_gain;
                     // Violent jitter at the very edge (bottom 3 lines)
-                    if (y >= H-3) hsTearing += std::normal_distribution<float>(0, 8)(rng);
+                    // Bad motors make this much worse
+                    if (y >= H-3) hsTearing += std::normal_distribution<float>(0, 8 + motor_defect * 20)(rng);
+                }
+
+                // Motor vibration adds high-frequency noise to tracking
+                // This causes "fizz" or "hash" on the RF signal
+                float motor_rf_noise = 0.0f;
+                if (motor_defect > 0.05f) {
+                    motor_rf_noise = motor_vibration * 0.05f;  // Small but visible as noise
                 }
 
                 // --- Massive H-SYNC Roll & Tracking Shear ---
@@ -482,6 +619,25 @@ public:
                 }
 
                 float tbe_start = total_h_warp + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
+
+                // ── Wow-induced TBE bending ──────────────────────────────────
+                // Real VHS timebase error creates the classic "flagging" bend
+                // at the TOP of the image. The VCR's H-sync pulse provides
+                // the timing reference at the start of each scanline. Tape
+                // speed error (wow/flutter) causes each successive line to
+                // start at a slightly wrong horizontal position.
+                //
+                // The bending is concentrated at the top and decays downward
+                // as the TV's AFC circuit catches up. The bend is NOT uniform
+                // — only the upper portion of the image curves.
+                // Real VHS flagging is typically 5-15px at the top edge.
+                float bend_fraction = std::exp(-float(y) * 0.012f);
+                // At y=0: bend_fraction = 1.0 (full displacement)
+                // At y=100: bend_fraction = 0.30
+                // At y=250: bend_fraction = 0.05 (essentially straight)
+                float wow_bend = wow_dev * float(W) * 0.3f * bend_fraction;     // up to ±9.6 px at top
+                float flutter_bend = flutter_dev * float(W) * 0.15f * bend_fraction;  // up to ±1 px
+                tbe_start += wow_bend + flutter_bend;
                 
                 // Stretch/squash line internally: simulates tape speed variation
                 // *within* a single scanline (real VHS tape stretches under tension)
@@ -494,16 +650,62 @@ public:
 
                 const float linePhase = fPhase + float(y) * kPI;
 
+                // ── Per-line wow/flutter chroma phase offsets ────────────────
+                // Real VHS wow/flutter creates very subtle chroma phase errors.
+                // The VCR's internal chroma converter shifts the subcarrier
+                // frequency uniformly during both record and playback, so the
+                // TV's color PLL sees a clean, consistent subcarrier.
+                //
+                // Residual errors come from:
+                //   - Mechanical tape bounce causing micro phase shifts (~0.1-1°)
+                //   - Flutter exceeding PLL response bandwidth (~0.05-0.5°)
+                // These are tiny — VHS color is dominated by overall hue offset
+                // (the TBC HUE knob), not per-line rainbowing.
+                //
+                // Values are in radians. Max settings produce ~1-2° phase error.
+                float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + wallTime_ * 1.2f);
+                float line_flutter_base = flutter_dev * 0.008f *
+                    std::sin(float(y) * 0.3f + wallTime_ * 47.0f) *
+                    std::normal_distribution<float>(0.0f, 1.0f)(rng);
+
                 // --- ENCODE ---
                 float d_tail = 0.0f;
+
+                // ── Oxide Dropout Scheduling ────────────────────────────────
+                // Real VHS dropouts are random missing oxide patches on the tape.
+                // They cause brief signal loss — the scanline goes to black/static
+                // for a few pixels to ~100 pixels. Dropouts are more frequent on
+                // worn tapes and cause the classic "sparkle" or "snow" artifacts.
+                // Rate: 0.01 = occasional sparkle, 0.1 = heavy dropout storm
+                float dropout_active = false;
+                float dropout_duration = 0.0f;
+                float dropout_x_pos = 0.0f;
+
+                // Check if a dropout event occurs this line
+                if (ep.dropout_rate > 0.005f) {
+                    // Probability of at least one dropout per line
+                    float line_dropout_prob = ep.dropout_rate * 0.4f;  // scale to visible
+                    std::uniform_real_distribution<float> dropout_rng(0, 1);
+                    std::uniform_real_distribution<float> duration_rng(10, 180);
+                    std::uniform_real_distribution<float> pos_rng(H_BLANK + 10, H_BLANK + W - 30);
+                    if (dropout_rng(rng) < line_dropout_prob) {
+                        dropout_active = true;
+                        dropout_duration = 10.0f + dropout_rng(rng) * duration_rng(rng);
+                        dropout_x_pos = pos_rng(rng);
+                    }
+                }
+
                 for (int x = 0; x < W_TOTAL; ++x) {
                     float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                     float xSrc = (float)x - current_tbe;
                     xSrc = std::fmod(xSrc, float(W_TOTAL));
                     if (xSrc < 0.0f) xSrc += float(W_TOTAL);
-                    // Use consistent subcarrier phase: linePhase + xSrc * kSC_PX
-                    // The tape speed affects the subcarrier frequency during playback
-                    float theta = linePhase + xSrc * kSC_PX;
+
+                    // ── Encode at nominal subcarrier frequency ────────────────
+                    // The VCR handles subcarrier frequency conversion internally.
+                    // We encode at the nominal 227.5 cycles/line with tiny
+                    // per-line phase offsets simulating mechanical residuals.
+                    float theta = linePhase + xSrc * kSC_PX + line_wow_offset;
 
                     float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -543,6 +745,31 @@ public:
                          if (noise_amp > 0.35f) { I *= 0.2f; Q *= 0.2f; }
                     }
 
+                    // ── Oxide Dropout: signal goes to black/static ───────────
+                    // During a dropout event, the RF signal is lost.
+                    // Creates black spots with white edge "sparkle" — the classic
+                    // VHS dropout look.
+                    if (dropout_active) {
+                        float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
+                        if (dist_to_dropout < dropout_duration * 0.5f) {
+                            // Inside the dropout region
+                            float edge_dist = std::min(
+                                std::abs(dist_to_dropout - dropout_duration * 0.5f + 3.0f),
+                                std::abs(dist_to_dropout + dropout_duration * 0.5f - 3.0f)
+                            );
+                            if (edge_dist < 3.0f) {
+                                // Edge sparkle: white flash at dropout boundaries
+                                Y = 1.0f + std::uniform_real_distribution<float>(-0.3f, 0.5f)(rng);
+                                I = 0.0f; Q = 0.0f;
+                            } else {
+                                // Core dropout: black or very dark noise
+                                Y = -0.1f + std::uniform_real_distribution<float>(0, 1)(rng) * 0.15f;
+                                I = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
+                                Q = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
+                            }
+                        }
+                    }
+
                     comp_line[x] = Y + I * std::cos(theta) - Q * std::sin(theta);
                 }
 
@@ -561,7 +788,16 @@ public:
                 phase_accum = std::atan2(sumQ, sumI) - (kPI / 2.0f);
 
                 // --- TBC FAILURE (Loss of Color Lock) ---
-                float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f + ep.flutter_dep * 0.15f;
+                // Wow/flutter degrade the PLL's ability to maintain color lock.
+                // Real VHS color PLL has limited capture range (~±30 degrees)
+                // and response bandwidth (~10 Hz). Fast flutter exceeds this.
+                // The wow/flutter residuals are very small (sub-degree), so
+                // the PLL handles most of it fine — only extreme flutter
+                // causes noticeable instability.
+                float wow_flutter_phase_error = std::abs(line_wow_offset) + std::abs(line_flutter_base);
+                float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f
+                                      + ep.flutter_dep * 0.15f
+                                      + wow_flutter_phase_error * 0.2f;
                 if (ep.dropout_rate > 0.01f) {
                      if (std::uniform_real_distribution<float>(0, 1)(rng) < ep.dropout_rate * 0.5f) {
                          pll_instability += 2.0f;
@@ -578,10 +814,22 @@ public:
                     int x = out_x + H_BLANK;
                     float sig = comp_line[x];
 
+                    // ── Within-line flutter (active video only) ──────────────
+                    // Real VHS tape flutter varies WITHIN a scanline because
+                    // tape elasticity causes micro-speed variations.
+                    // The burst gate (pixels 70-110) measures the average phase,
+                    // but the active video region has different instantaneous
+                    // phase. This creates very subtle VHS chroma "swim"
+                    // where colors shift slightly across the image.
+                    float x_norm = float(out_x) / float(W);  // 0..1 across active video
+                    float within_line_flutter = line_flutter_base *
+                        (0.5f + 0.5f * std::sin(x_norm * 12.0f + wallTime_ * 37.0f));
+
                     // 1. Adaptive Phase Tracking Simulation
                     pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
-                    // Match the encode phase reference: linePhase + x * kSC_PX
-                    float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum;
+                    // Decode: nominal subcarrier + burst correction + tiny within-line flutter error
+                    float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum
+                                   + within_line_flutter;
 
                     // 2. Extract Luma
                     lpY += lpfA * (sig - lpY);
@@ -630,7 +878,7 @@ public:
             // AFC Pull-in: Error decays exponentially as TV catches sync.
             // Real VHS PLL pull-in time constant is ~3-8 scanlines.
             // Creates the classic "flagging" bend at the top of screen.
-            float line_afc = afc_error_ * std::exp(-float(y) * 0.125f);  // ~8 line decay
+            float line_afc = afc_error_ * std::exp(-float(y) * 0.08f);  // ~30 line decay
 
             // Guide-roller micro-bounce: impulsive spike every ~80-200 lines
             // Multiple bounce points for more chaotic behavior.
@@ -650,25 +898,42 @@ public:
             // Add the immediate physical jitter to the AFC baseline
             float total_h_warp = line_afc + mechanical_wow_ + scrape_flutter + guide_bounce;
 
-            // --- C. Motor Drag & Belt Slips (Mid-screen AFC Snapping) ---
-            float drag_hz = 0.5f + ep.motor_health * 2.0f;
-            // Locate the 'snap' point vertically based on phase
+            // --- C. Motor Degradation: Drag, Belt Slips, Drum Wobble ---
+            float drag_hz = 0.5f + ep.motor_drag * 2.0f;
             float drag_phase = std::fmod(tapeTime_ * drag_hz, 1.0f) * H;
             float dy = float(y) - drag_phase;
             float beltSlip = 0.0f;
             if (dy > 0.0f && dy < 100.0f && ep.motor_drag > 0.01f) {
-                // Underdamped ringing as AFC tries to catch the slip
                 beltSlip = std::exp(-dy * 0.05f) * std::sin(dy * 0.2f) * (ep.motor_drag * 20.0f);
             }
 
+            // Motor defect artifacts
+            // Drum wobble: per-line jitter at drum rotation frequency
+            // Subtle — bearing wear creates fine jitter, not large shifts.
+            float drum_wobble_tbe = 0.0f;
+            if (motor_defect > 0.05f) {
+                float drum_wobble_amp = motor_defect * 1.5f;  // Max ±1.5px
+                drum_wobble_tbe = drum_wobble_amp * std::sin(drum_wobble_phase + float(y) * 0.05f);
+            }
+            total_h_warp += drum_wobble_tbe;
+
             // --- D. Head Switch Noise (VHS Tearing at bottom of VBI) ---
-            // Approaching the bottom of the visible frame, the head switch causes a phase jump.
+            // Motor degradation makes head switching unstable
             float hsTearing = 0.0f;
-            if (y >= H - kHS_VBI_LINES) {
-                float hsDepth = (y - (H - kHS_VBI_LINES)) / kHS_VBI_LINES;
-                hsTearing = std::pow(hsDepth, 2.0f) * 12.0f; 
-                // Add some noise to the head switch
-                hsTearing += std::normal_distribution<float>(0, 1)(rng) * 2.0f;
+            float hs_line_offset = motor_defect * 12.0f *
+                std::sin(tapeTime_ * 1.5f * 2.0f * kPI);
+            int hs_start = std::max(0, H - int(kHS_VBI_LINES) + int(hs_line_offset));
+            if (y >= hs_start) {
+                float hsDepth = (float(y) - float(hs_start)) / float(kHS_VBI_LINES);
+                float hs_gain = 12.0f + motor_defect * 20.0f;
+                hsTearing = std::pow(hsDepth, 2.0f) * hs_gain;
+                hsTearing += std::normal_distribution<float>(0, 1 + motor_defect * 8)(rng);
+            }
+
+            // Motor vibration RF noise
+            float motor_rf_noise = 0.0f;
+            if (motor_defect > 0.05f) {
+                motor_rf_noise = motor_vibration * 0.05f;
             }
 
             // --- Massive H-SYNC Roll & Tracking Shear ---
@@ -710,6 +975,13 @@ public:
 
             float tbe_start = total_h_warp + beltSlip + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
 
+            // Wow-induced TBE bending (top-of-screen flagging)
+            // Real VHS flagging is typically 5-15px at the top edge
+            float bend_fraction = std::exp(-float(y) * 0.012f);
+            float wow_bend = wow_dev * float(W) * 0.3f * bend_fraction;
+            float flutter_bend = flutter_dev * float(W) * 0.15f * bend_fraction;
+            tbe_start += wow_bend + flutter_bend;
+
             // Stretch/squash line internally: simulates tape speed variation
             // *within* a single scanline (real VHS tape stretches under tension)
             float tbe_slope = scrape_flutter * 0.25f;
@@ -720,11 +992,36 @@ public:
 
             const float linePhase = fPhase + float(y) * kPI;
 
+            // Per-line wow offset for single-threaded path
+            // Very subtle: max 1-2° phase error at max settings
+            float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + wallTime_ * 1.2f);
+            float line_flutter_base = flutter_dev * 0.008f *
+                std::sin(float(y) * 0.3f + wallTime_ * 47.0f) *
+                std::normal_distribution<float>(0.0f, 1.0f)(rng);
+
             // --- ENCODE ---
+            // Oxide dropout scheduling for single-threaded path
+            float dropout_active = false;
+            float dropout_duration = 0.0f;
+            float dropout_x_pos = 0.0f;
+            if (ep.dropout_rate > 0.005f) {
+                float line_dropout_prob = ep.dropout_rate * 0.4f;
+                std::uniform_real_distribution<float> dropout_rng(0, 1);
+                std::uniform_real_distribution<float> duration_rng(10, 180);
+                std::uniform_real_distribution<float> pos_rng(H_BLANK + 10, H_BLANK + W - 30);
+                if (dropout_rng(rng) < line_dropout_prob) {
+                    dropout_active = true;
+                    dropout_duration = 10.0f + dropout_rng(rng) * duration_rng(rng);
+                    dropout_x_pos = pos_rng(rng);
+                }
+            }
+
             for (int x = 0; x < W_TOTAL; ++x) {
                 float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                 float xSrc = (float)x - current_tbe;
-                float theta = linePhase + xSrc * kSC_PX;
+
+                // Encode at nominal subcarrier frequency with tiny per-line offset
+                float theta = linePhase + xSrc * kSC_PX + line_wow_offset;
 
                 float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -751,6 +1048,26 @@ public:
                           I = 0.0f; Q = 0.0f; // Pure uncolored noise
                      }
                 }
+
+                // Oxide dropout: signal goes to black/static
+                if (dropout_active) {
+                    float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
+                    if (dist_to_dropout < dropout_duration * 0.5f) {
+                        float edge_dist = std::min(
+                            std::abs(dist_to_dropout - dropout_duration * 0.5f + 3.0f),
+                            std::abs(dist_to_dropout + dropout_duration * 0.5f - 3.0f)
+                        );
+                        if (edge_dist < 3.0f) {
+                            Y = 1.0f + std::uniform_real_distribution<float>(-0.3f, 0.5f)(rng);
+                            I = 0.0f; Q = 0.0f;
+                        } else {
+                            Y = -0.1f + std::uniform_real_distribution<float>(0, 1)(rng) * 0.15f;
+                            I = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
+                            Q = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
+                        }
+                    }
+                }
+
                 comp_line[x] = Y + I * std::cos(theta) - Q * std::sin(theta);
             }
 
@@ -767,7 +1084,10 @@ public:
             phase_accum = std::atan2(sumQ, sumI) - (kPI / 2.0f);
 
             // --- TBC FAILURE (Loss of Color Lock) ---
-            float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f + ep.flutter_dep * 0.15f;
+            float wow_flutter_phase_error = std::abs(line_wow_offset) + std::abs(line_flutter_base);
+            float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f
+                                  + ep.flutter_dep * 0.15f
+                                  + wow_flutter_phase_error * 0.2f;
             if (ep.dropout_rate > 0.01f) {
                  if (std::uniform_real_distribution<float>(0, 1)(rng) < ep.dropout_rate * 0.5f) {
                      pll_instability += 2.0f;
@@ -786,8 +1106,15 @@ public:
 
                 // 1. Adaptive Phase Tracking Simulation
                 pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
-                // Match the encode phase reference: linePhase + x * kSC_PX
-                float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum;
+
+                // Within-line flutter (active video only)
+                float x_norm = float(out_x) / float(W);
+                float within_line_flutter = line_flutter_base *
+                    (0.5f + 0.5f * std::sin(x_norm * 12.0f + wallTime_ * 37.0f));
+
+                // Decode: nominal subcarrier + burst correction + within-line flutter error
+                float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum
+                               + within_line_flutter;
 
                 // 2. Extract Luma
                 lpY += lpfA * (sig - lpY);
@@ -1664,16 +1991,6 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
             app.pp.fx.type=(Effects::Type)i;Effects::s_trail=cv::Mat();}
         if(sel)ImGui::PopStyleColor();
         if(i%2==0)ImGui::SameLine();}
-    sectionHdr("EFFECT PARAMS");
-    {Effects::Params fxL;{std::lock_guard<std::mutex> lk(app.pp.mu);fxL=app.pp.fx;}
-     bool ch=false;
-     auto sl=[&](const char*n,float*v,float lo,float hi){
-         ImGui::SetNextItemWidth(colW-100);ch|=ImGui::SliderFloat(n,v,lo,hi);};
-     sl("AMOUNT",&fxL.amount,0,1);sl("SPEED",&fxL.speed,0,1);
-     sl("DEPTH",&fxL.depth,0,1);sl("MIX",&fxL.mix,0,1);
-     if(ch){std::lock_guard<std::mutex> lk(app.pp.mu);
-         app.pp.fx.amount=fxL.amount;app.pp.fx.speed=fxL.speed;
-         app.pp.fx.depth=fxL.depth;app.pp.fx.mix=fxL.mix;}}
     ImGui::EndChild();ImGui::SameLine();
 
     // ─── COL 2: VIDEO PROCESSING ─────────────────────────────
@@ -1702,17 +2019,14 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         sl3("WOW",&bp.wow_dep,0,5);
         sl3("FLUTTER",&bp.flutter_dep,0,1);
         bp.flutter_dep = std::max(bp.flutter_dep, 0.001f); // floor to avoid pathological zero
-        sl3("MOTOR HLTH",&bp.motor_health,0,.9f);
-        sl3("MOTOR DRAG",&bp.motor_drag,0,.9f);sl3("DROPOUT",&bp.dropout_rate,0,.1f);
-        sectionHdr("VCR GEOMETRY WARPING");
-        sl3("TRACKING OFF", &app.videoParams.tracking_error, 0.f, 1.f);
-        sl3("TAPE CREASE",  &app.videoParams.tape_crease, 0.f, 1.f);
-        sl3("H/V HOLD FAIL", &app.videoParams.sync_hold_failure, 0.f, 1.f);
-        sectionHdr("MAGNETIC");
-        sl3("DEMAGNETIZE",&bp.demagnetization,0,1);sl3("PRINT-THRU",&bp.print_through,0,.5f);
-        sl3("AZIMUTH",&bp.azimuth_drift,0,1);sl3("CROSSTALK",&bp.crosstalk,0,.3f);
-        sectionHdr("ELECTRONICS");
-        sl3("TAPE HISS",&bp.hiss,0,.02f);sl3("HEAD BUMP",&bp.head_bump,0,1);
+        sl3("MOTOR DEGRADE",&bp.motor_health,0,1);
+        sl3("MOTOR DRAG",&bp.motor_drag,0,.9f);
+        sl3("DROPOUT",&bp.dropout_rate,0,.1f);
+        sectionHdr("ELECTRONICS & NOISE");
+        sl3("TAPE HISS",&bp.hiss,0,.02f);
+        sl3("HISS COLOR",&bp.hiss_color,0,1);
+        sl3("MAINS HUM",&bp.mains_hum,0,.05f);
+        sl3("HEAD BUMP",&bp.head_bump,0,1);
         sl3("HF CUTOFF",&bp.cutoff_base,1000,20000);
         {
             std::lock_guard<std::mutex> lk2(app.pp.mu);
@@ -1741,13 +2055,12 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     sectionHdr("TAPE PRESETS");
     struct PR{const char*n;std::function<void(EngineParams&)>fn;};
     static const PR prs[]={
-        {"CLEAN DIGITAL",[](EngineParams&p){p={};p.ips_base=15;p.hiss=.001f;p.cutoff_base=20000;}},
-        {"VHS  SP",      [](EngineParams&p){p={};p.ips_base=15;p.wow_dep=.5f;p.flutter_dep=.15f;p.head_bump=.4f;p.hiss=.003f;p.cutoff_base=12000;}},
-        {"VHS  LP",      [](EngineParams&p){p={};p.ips_base=7.5f;p.wow_dep=1.5f;p.flutter_dep=.3f;p.head_bump=.6f;p.hiss=.006f;p.cutoff_base=8000;p.print_through=.1f;}},
-        {"VHS  EP",      [](EngineParams&p){p={};p.ips_base=3.75f;p.wow_dep=3.f;p.flutter_dep=.6f;p.motor_health=.6f;p.head_bump=.8f;p.hiss=.01f;p.cutoff_base=5000;p.demagnetization=.4f;p.print_through=.2f;}},
-        {"WORN  EP",     [](EngineParams&p){p={};p.ips_base=3.75f;p.wow_dep=4.f;p.flutter_dep=.8f;p.motor_health=.75f;p.sticky_shed=.08f;p.dropout_rate=.05f;p.demagnetization=.7f;p.cutoff_base=3000;p.hiss=.015f;}},
-        {"METAL TAPE",   [](EngineParams&p){p={};p.ips_base=15;p.bias=1.5f;p.drive=1.5f;p.hiss=.0005f;p.cutoff_base=18000;p.oxide_type="Metal";}},
-        {"DEGRADED",     [](EngineParams&p){p={};p.ips_base=7.5f;p.wow_dep=4.f;p.flutter_dep=.8f;p.motor_health=.8f;p.sticky_shed=.08f;p.oxide_shedding=.3f;p.dropout_rate=.05f;p.demagnetization=.7f;p.cutoff_base=3000;p.hiss=.015f;}},
+        {"CLEAN DIGITAL",[](EngineParams&p){p={};p.ips_base=15;p.cutoff_base=20000;}},
+        {"VHS  SP",      [](EngineParams&p){p={};p.ips_base=15;p.wow_dep=.5f;p.flutter_dep=.15f;p.head_bump=.4f;p.cutoff_base=12000;p.hiss=.003f;}},
+        {"VHS  LP",      [](EngineParams&p){p={};p.ips_base=7.5f;p.wow_dep=1.5f;p.flutter_dep=.3f;p.head_bump=.6f;p.cutoff_base=8000;p.hiss=.006f;p.hiss_color=.15f;}},
+        {"VHS  EP",      [](EngineParams&p){p={};p.ips_base=3.75f;p.wow_dep=3.f;p.flutter_dep=.6f;p.motor_health=.6f;p.head_bump=.8f;p.cutoff_base=5000;p.hiss=.01f;p.hiss_color=.25f;p.demagnetization=.4f;p.print_through=.2f;}},
+        {"WORN  EP",     [](EngineParams&p){p={};p.ips_base=3.75f;p.wow_dep=4.f;p.flutter_dep=.8f;p.motor_health=.75f;p.sticky_shed=.08f;p.dropout_rate=.05f;p.demagnetization=.7f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.35f;p.mains_hum=.015f;}},
+        {"DEGRADED",     [](EngineParams&p){p={};p.ips_base=7.5f;p.wow_dep=4.f;p.flutter_dep=.8f;p.motor_health=.8f;p.sticky_shed=.08f;p.oxide_shedding=.3f;p.dropout_rate=.05f;p.demagnetization=.7f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.3f;p.mains_hum=.025f;}},
     };
     for(auto&pr:prs){
         if(ImGui::Button(pr.n,{colW-18,0})){
@@ -2032,12 +2345,11 @@ int main(int,char**){
          if(app.tapeEngine&&app.audioIO&&app.audioIO->is_open()){
              EngineParams active = app.baseParams;
              // ─── Diegetic HiFi Loss ───────────────────────────────────────
-             // Compute signal quality from the RAW base params only — NOT from
-             // `active`, which is already modified by prior physics steps.
-             // This breaks the feedback loop that caused runaway dropout.
+             // Compute signal quality from video-relevant parameters only
+             // (dropout_rate, tracking_error are the user-controllable ones
+             // that actually affect the rendered image)
              float signal_loss = std::clamp(
                  app.baseParams.dropout_rate * 4.0f
-                 + app.baseParams.demagnetization * 0.6f
                  + (app.videoParams.tracking_error * 2.0f),
                  0.0f, 1.0f);
              static float hifi_blend_lpf = 0.0f;
@@ -2084,10 +2396,13 @@ int main(int,char**){
                  }
              }
 
-             float mh = app.baseParams.motor_health;
-             if (mh > 0.1f) {
-                 active.wow_dep += mh * 2.5f; // Drastic pitch sag 
-                 active.flutter_dep += mh * 0.3f; // Grinding motor bearings
+             // Motor degradation affects audio: bad motor causes wow/flutter
+             // plus additional artifacts like dropouts and pitch instability
+             float motor_defect = std::clamp(app.baseParams.motor_health, 0.0f, 1.0f);
+             if (motor_defect > 0.05f) {
+                 active.wow_dep += motor_defect * 3.0f;     // Bad motor = slow wow
+                 active.flutter_dep += motor_defect * 0.5f;  // Bad motor = fast flutter
+                 active.dropout_rate += motor_defect * 0.03f; // Motor cogging causes dropouts
              }
 
              float spd=1.f;
