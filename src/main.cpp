@@ -1285,6 +1285,7 @@ static std::atomic<int64_t> g_audioSamplePos{0};
 static std::atomic<float>   g_sourceFPS{kNTSC_FPS};  // default to NTSC 29.97
 static std::atomic<bool>    g_videoReset{false};
 static std::atomic<bool>    g_pipelineFlush{false};  // clear queues + reset counters
+static std::atomic<bool>    g_videoEnded{false};     // video reached end, switch to demo
 
 // ============================================================
 //  §7  ProcessParams & Pipeline
@@ -1537,7 +1538,10 @@ private:
                 if(delta>4) cap.set(cv::CAP_PROP_POS_FRAMES,double(targetFrame));
                 else if(delta<-1){std::this_thread::sleep_for(std::chrono::milliseconds(4));continue;}
                 if(!cap.read(frame)||frame.empty()){
-                    cap.set(cv::CAP_PROP_POS_FRAMES,0);g_audioSamplePos.store(0);continue;}
+                    // Video ended — signal main loop to switch back to demo
+                    cap.release();
+                    g_videoEnded.store(true);
+                    continue;}
                 cv::resize(frame,frame,{FW,FH});
             }else{std::this_thread::sleep_for(std::chrono::milliseconds(10));continue;}
 
@@ -1944,17 +1948,31 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     ImGui::BeginChild("##c1",{colW,ctrlH-4},true);
     sectionHdr("INPUT SOURCE");
     auto stopAudioAndClear = [&app](){
+        // 1. Signal pipeline to stop using tapeEnginePtr FIRST
+        { std::lock_guard<std::mutex> lk(app.pp.mu);
+          app.pp.engValid.store(false);
+          app.pp.exPtr->tapeEnginePtr = nullptr; }
+
+        // 2. Wait for pipeline thread to finish current iteration (~33ms/frame)
+        //    This prevents use-after-free if pipeline thread already read
+        //    tapeEnginePtr but hasn't accessed it yet.
+        SDL_Delay(50);
+
+        // 3. Now safe to destroy engine — pipeline won't touch it
         std::lock_guard<std::mutex> lk(app.audioMu);
         std::string oldWav;
         { std::lock_guard<std::mutex> flk(app.fileMu); oldWav = app.audioWavPath; app.audioWavPath=""; }
-        
-        if(app.audioIO){app.audioIO->stop(); app.audioIO->close();}
-        app.audioIO.reset(); app.tapeEngine.reset();
-        
+
+        if(app.audioIO){
+            app.audioIO->stop();
+            app.audioIO->close();  // joins DSP thread — blocks until it exits
+        }
+        app.audioIO.reset();
+        app.tapeEngine.reset();
+
         if(!oldWav.empty()) std::remove(oldWav.c_str());
-        
+
         app.pipeline.rawQ.clear(); app.pipeline.outQ.clear();
-        std::lock_guard<std::mutex> lk2(app.pp.mu); app.pp.engValid.store(false);
     };
 
     auto srcBtnWithStop=[&](const char* lbl,SourceType st){
@@ -2437,6 +2455,37 @@ int main(int,char**){
               app.pp.tapeSpd=spd; app.pp.instantSpd=app.tapeEngine->transport.last_instant_speed; app.pp.engValid.store(true);
               app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
              }}}
+
+        // ── VIDEO ENDED: switch back to demo source ────────────────────────
+        if (g_videoEnded.exchange(false)) {
+            // 1. Signal pipeline to stop using tapeEnginePtr FIRST
+            { std::lock_guard<std::mutex> lk(app.pp.mu);
+              app.pp.engValid.store(false);
+              app.pp.exPtr->tapeEnginePtr = nullptr; }
+            // 2. Wait for pipeline thread to finish current iteration
+            SDL_Delay(50);
+            // 3. Now safe to destroy engine
+            {
+                std::lock_guard<std::mutex> lk(app.audioMu);
+                if(app.audioIO){app.audioIO->stop(); app.audioIO->close();}
+                app.audioIO.reset();
+                app.tapeEngine.reset();
+                std::string oldWav;
+                { std::lock_guard<std::mutex> flk(app.fileMu); oldWav = app.audioWavPath; app.audioWavPath=""; }
+                if(!oldWav.empty()) std::remove(oldWav.c_str());
+            }
+            // Clear file path so capture thread doesn't try to reload
+            { std::lock_guard<std::mutex> flk(app.fileMu); app.filePath=""; }
+            // Switch capture to demo mode
+            app.capture.sourceType.store(SourceType::Demo);
+            // Clear stale frames
+            { std::lock_guard<std::mutex> lk(app.frameMu);
+              app.lastOut = cv::Mat{}; app.lastRaw = cv::Mat{}; }
+            app.pipeline.rawQ.clear();
+            app.pipeline.outQ.clear();
+            g_audioSamplePos.store(0);
+            g_sourceFPS.store(kNTSC_FPS);
+        }
 
         // Copy lastOut to lastRaw for source monitor
         {std::lock_guard<std::mutex> lk(app.frameMu);
