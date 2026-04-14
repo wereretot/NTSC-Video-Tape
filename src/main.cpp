@@ -479,8 +479,9 @@ public:
                 //   - Head-switch transients (bottom VBI tear)
 
                 // Per-line FAST scrape flutter (high-frequency noise)
-                // Real VHS head-to-tape friction creates 50-200 Hz jitter
-                float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 6.0f)(rng);
+                // Real VHS head-to-tape friction creates fine per-line jitter.
+                // This is SUBTLE — typically 0.1-0.5px RMS, not whole-pixel shifts.
+                float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 0.4f)(rng);
 
                 // AFC Pull-in: Error decays exponentially as TV catches sync.
                 // Real VHS PLL pull-in time constant is ~3-8 scanlines.
@@ -636,7 +637,7 @@ public:
                 // At y=100: bend_fraction = 0.30
                 // At y=250: bend_fraction = 0.05 (essentially straight)
                 float wow_bend = wow_dev * float(W) * 0.3f * bend_fraction;     // up to ±9.6 px at top
-                float flutter_bend = flutter_dev * float(W) * 0.15f * bend_fraction;  // up to ±1 px
+                float flutter_bend = flutter_dev * float(W) * 0.08f * bend_fraction;  // up to ±0.4 px
                 tbe_start += wow_bend + flutter_bend;
                 
                 // Stretch/squash line internally: simulates tape speed variation
@@ -872,8 +873,9 @@ public:
             //   - Head-switch transients (bottom VBI tear)
 
             // Per-line FAST scrape flutter (high-frequency noise)
-            // Real VHS head-to-tape friction creates 50-200 Hz jitter
-            float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 6.0f)(rng);
+            // Real VHS head-to-tape friction creates fine per-line jitter.
+            // This is SUBTLE — typically 0.1-0.5px RMS, not whole-pixel shifts.
+            float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 0.4f)(rng);
 
             // AFC Pull-in: Error decays exponentially as TV catches sync.
             // Real VHS PLL pull-in time constant is ~3-8 scanlines.
@@ -979,7 +981,7 @@ public:
             // Real VHS flagging is typically 5-15px at the top edge
             float bend_fraction = std::exp(-float(y) * 0.012f);
             float wow_bend = wow_dev * float(W) * 0.3f * bend_fraction;
-            float flutter_bend = flutter_dev * float(W) * 0.15f * bend_fraction;
+            float flutter_bend = flutter_dev * float(W) * 0.08f * bend_fraction;
             tbe_start += wow_bend + flutter_bend;
 
             // Stretch/squash line internally: simulates tape speed variation
