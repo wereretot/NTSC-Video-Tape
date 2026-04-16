@@ -375,9 +375,19 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
     sl3("HF CUTOFF", &bp.cutoff_base, 1000, 20000);
     ImGui::EndDisabled();
 
+    sectionHdr("HELICAL SCAN / HEAD");
+    ImGui::BeginDisabled(!hasTapeEngine);
+    sl3("HEAD SWEEP", &app.videoParams.helical_sweep, 0, 1);
+    sl3("HS JITTER", &app.videoParams.head_switch_jitter, 0, 1);
+    sl3("FM CARRIER NOISE", &app.videoParams.fm_carrier_noise, 0, 1);
+    sl3("CHROMA XTALK", &app.videoParams.chroma_crosstalk, 0, 1);
+    sl3("FIELD PHASE ERR", &app.videoParams.inter_field_phase_error, 0, 1);
+    sl3("HEAD PRE-ECHO", &app.videoParams.head_pre_echo, 0, 1);
+    sl3("DRUM ECCENTRIC", &app.videoParams.drum_eccentricity, 0, 1);
+    ImGui::EndDisabled();
+
     {
         std::lock_guard<std::mutex> lk2(app.pp.mu);
-        bp.tracking_error = app.videoParams.tracking_error;
         app.pp.epSnap = bp;
         app.pp.vpSnap = app.videoParams;
         app.pp.tapeSpd = bp.tape_speed_mult;
@@ -401,20 +411,21 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
 
     ImGui::BeginChild("##c3", {colW, ctrlH - 4}, true);
     sectionHdr("TAPE PRESETS");
-    struct PR { const char* n; std::function<void(EngineParams&)> fn; };
+    struct PR { const char* n; std::function<void(EngineParams&, VideoParams&)> fn; };
     static const PR prs[] = {
-        {"CLEAN DIGITAL", [](EngineParams& p) { p = {}; p.ips_base = 15; p.cutoff_base = 20000; }},
-        {"VHS  SP",      [](EngineParams& p) { p = {}; p.ips_base = 15; p.wow_dep = .5f; p.flutter_dep = .15f; p.head_bump = .4f; p.cutoff_base = 12000; p.hiss = .003f; }},
-        {"VHS  LP",      [](EngineParams& p) { p = {}; p.ips_base = 7.5f; p.wow_dep = 1.5f; p.flutter_dep = .3f; p.head_bump = .6f; p.cutoff_base = 8000; p.hiss = .006f; p.hiss_color = .15f; }},
-        {"VHS  EP",      [](EngineParams& p) { p = {}; p.ips_base = 3.75f; p.wow_dep = 3.f; p.flutter_dep = .6f; p.motor_health = .6f; p.head_bump = .8f; p.cutoff_base = 5000; p.hiss = .01f; p.hiss_color = .25f; p.demagnetization = .4f; p.print_through = .2f; }},
-        {"WORN  EP",     [](EngineParams& p) { p = {}; p.ips_base = 3.75f; p.wow_dep = 4.f; p.flutter_dep = .8f; p.motor_health = .75f; p.sticky_shed = .08f; p.dropout_rate = .05f; p.demagnetization = .7f; p.cutoff_base = 3000; p.hiss = .015f; p.hiss_color = .35f; p.mains_hum = .015f; }},
-        {"DEGRADED",     [](EngineParams& p) { p = {}; p.ips_base = 7.5f; p.wow_dep = 4.f; p.flutter_dep = .8f; p.motor_health = .8f; p.sticky_shed = .08f; p.oxide_shedding = .3f; p.dropout_rate = .05f; p.demagnetization = .7f; p.cutoff_base = 3000; p.hiss = .015f; p.hiss_color = .3f; p.mains_hum = .025f; }},
+        {"CLEAN DIGITAL", [](EngineParams& p, VideoParams& v) { p = {}; p.ips_base = 15; p.cutoff_base = 20000; v = {}; }},
+        {"VHS  SP",      [](EngineParams& p, VideoParams& v) { p = {}; p.ips_base = 15; p.wow_dep = .5f; p.flutter_dep = .15f; p.head_bump = .4f; p.cutoff_base = 12000; p.hiss = .003f; v = {}; v.helical_sweep = .5f; v.head_switch_jitter = .15f; v.fm_carrier_noise = .08f; v.chroma_crosstalk = .12f; v.inter_field_phase_error = .06f; v.head_pre_echo = .02f; }},
+        {"VHS  LP",      [](EngineParams& p, VideoParams& v) { p = {}; p.ips_base = 7.5f; p.wow_dep = 1.5f; p.flutter_dep = .3f; p.head_bump = .6f; p.cutoff_base = 8000; p.hiss = .006f; p.hiss_color = .15f; v = {}; v.helical_sweep = .55f; v.head_switch_jitter = .25f; v.fm_carrier_noise = .15f; v.chroma_crosstalk = .22f; v.inter_field_phase_error = .1f; v.head_pre_echo = .04f; }},
+        {"VHS  EP",      [](EngineParams& p, VideoParams& v) { p = {}; p.ips_base = 3.75f; p.wow_dep = 3.f; p.flutter_dep = .6f; p.motor_health = .6f; p.head_bump = .8f; p.cutoff_base = 5000; p.hiss = .01f; p.hiss_color = .25f; p.demagnetization = .4f; p.print_through = .2f; v = {}; v.helical_sweep = .65f; v.head_switch_jitter = .35f; v.fm_carrier_noise = .25f; v.chroma_crosstalk = .35f; v.inter_field_phase_error = .18f; v.head_pre_echo = .06f; v.drum_eccentricity = .1f; }},
+        {"WORN  EP",     [](EngineParams& p, VideoParams& v) { p = {}; p.ips_base = 3.75f; p.wow_dep = 4.f; p.flutter_dep = .8f; p.motor_health = .75f; p.sticky_shed = .08f; p.dropout_rate = .05f; p.demagnetization = .7f; p.cutoff_base = 3000; p.hiss = .015f; p.hiss_color = .35f; p.mains_hum = .015f; v = {}; v.helical_sweep = .75f; v.head_switch_jitter = .5f; v.fm_carrier_noise = .35f; v.chroma_crosstalk = .45f; v.inter_field_phase_error = .25f; v.head_pre_echo = .08f; v.drum_eccentricity = .2f; }},
+        {"DEGRADED",     [](EngineParams& p, VideoParams& v) { p = {}; p.ips_base = 7.5f; p.wow_dep = 4.f; p.flutter_dep = .8f; p.motor_health = .8f; p.sticky_shed = .08f; p.oxide_shedding = .3f; p.dropout_rate = .05f; p.demagnetization = .7f; p.cutoff_base = 3000; p.hiss = .015f; p.hiss_color = .3f; p.mains_hum = .025f; v = {}; v.helical_sweep = .7f; v.head_switch_jitter = .45f; v.fm_carrier_noise = .3f; v.chroma_crosstalk = .4f; v.inter_field_phase_error = .2f; v.head_pre_echo = .07f; v.drum_eccentricity = .15f; }},
     };
     for (auto& pr : prs) {
         if (ImGui::Button(pr.n, {colW - 18, 0})) {
-            app.setParam(pr.fn);
+            pr.fn(app.baseParams, app.videoParams);
             std::lock_guard<std::mutex> lk2(app.pp.mu);
             app.pp.epSnap = app.baseParams;
+            app.pp.vpSnap = app.videoParams;
             app.pp.tapeSpd = app.baseParams.tape_speed_mult;
             app.pp.engValid.store(true);
         }

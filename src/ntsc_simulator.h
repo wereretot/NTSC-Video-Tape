@@ -21,6 +21,14 @@ struct VideoParams {
     float luma_noise = 0.0f;
     float chroma_noise = 0.0f;
     float dropout_intensity = 0.0f;
+
+    float helical_sweep = 0.5f;
+    float head_switch_jitter = 0.3f;
+    float fm_carrier_noise = 0.15f;
+    float chroma_crosstalk = 0.2f;
+    float inter_field_phase_error = 0.1f;
+    float head_pre_echo = 0.0f;
+    float drum_eccentricity = 0.0f;
 };
 
 class NTSCSimulator {
@@ -44,6 +52,13 @@ public:
     int last_recording_id_ = 0;
     float recording_blend_ = 0.0f;
     float recording_transition_time_ = 0.0f;
+
+    int prev_field_ = -1;
+    float field_chroma_phase_accum_ = 0.0f;
+    float head_switch_offset_ = 0.0f;
+    float drum_ecc_phase_ = 0.0f;
+    float adjacent_track_phase_ = 0.0f;
+    float prev_line_luma_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     void initBuffers(int w, int h);
 

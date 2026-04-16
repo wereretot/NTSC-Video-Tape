@@ -20,6 +20,18 @@ static constexpr int   kNTSC_ACTIVE_LINES = 480;
 static constexpr float kHS_VBI_LINES = 15.f;
 static constexpr float kSC_FREQ      = 227.5f;
 
+static constexpr int   kFIELDS_PER_FRAME  = 2;
+static constexpr int   kLINES_PER_FIELD   = kNTSC_ACTIVE_LINES / kFIELDS_PER_FRAME;
+static constexpr float kVHS_DRUM_RPM      = 1800.f;
+static constexpr float kVHS_HEAD_ANGLE_DEG = 5.967f;
+static constexpr float kVHS_FM_CARRIER_SP = 4.4f;
+static constexpr float kVHS_FM_CARRIER_LP = 3.4f;
+static constexpr float kVHS_FM_DEV_SP     = 1.0f;
+static constexpr float kVHS_CHROMA_SHIFT  = 629.375f;
+static constexpr float kVHS_HSW_LINE      = 7.f;
+static constexpr float kVHS_TRACK_PITCH_SP = 0.049f;
+static constexpr float kVHS_TRACK_PITCH_LP = 0.0245f;
+
 namespace dsp {
 
 inline float clamp(float v, float lo = 0.f, float hi = 1.f) {

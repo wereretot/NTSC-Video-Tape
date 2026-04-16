@@ -42,6 +42,13 @@
 // ============================================================
 
 // ── CapstanVar ──────────────────────────────────────────────
+// dsp_types.hpp defines a global ::lerp which conflicts with
+// C++17 std::lerp when <math.h> is later included by SDL2.
+// Include <cmath> first (for std::sin, std::cos, std::lerp),
+// then block the C++ <math.h> wrapper from re-importing
+// std::lerp into the global namespace via 'using'.
+#include <cmath>
+#define _GLIBCXX_MATH_H
 #define _CMATH_
 #include "engine.hpp"
 #include "audio_io.hpp"
@@ -82,7 +89,7 @@ extern "C" {
 #include <atomic>
 #include <cassert>
 #include <chrono>
-#include <cmath>
+// <cmath> already included before CapstanVar headers
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -120,6 +127,10 @@ static constexpr int   kNTSC_TOTAL_LINES = 525;
 static constexpr int   kNTSC_ACTIVE_LINES = 480;
 // VBI head-switching: occurs in last ~15 lines of 525
 static constexpr float kHS_VBI_LINES = 15.f;
+static constexpr float kVHS_CHROMA_SHIFT  = 629.375f;
+static constexpr float kVHS_HSW_LINE      = 7.f;
+static constexpr float kVHS_DRUM_RPM      = 1800.f;
+static constexpr int   kLINES_PER_FIELD    = kNTSC_ACTIVE_LINES / 2;
 
 // ============================================================
 //  §1b  DSP helpers
@@ -127,7 +138,7 @@ static constexpr float kHS_VBI_LINES = 15.f;
 namespace dsp {
 inline float clamp(float v, float lo=0.f, float hi=1.f){return v<lo?lo:v>hi?hi:v;}
 inline uint8_t clamp8(float v){return uint8_t(std::max(0.f,std::min(255.f,v)));}
-inline float lerp(float a,float b,float t){return a+(b-a)*t;}
+inline float lerp(float a, float b, float t){return a+(b-a)*t;}
 
 inline cv::Vec3b bsample(const cv::Mat& s, float x, float y) {
     x=std::max(0.f,std::min(float(s.cols-1.001f),x));
@@ -244,6 +255,14 @@ struct VideoParams {
     float chroma_noise = 0.0f;
     float dropout_intensity = 0.0f;
     float signal_strength = 1.0f;
+
+    float helical_sweep = 0.5f;
+    float head_switch_jitter = 0.3f;
+    float fm_carrier_noise = 0.15f;
+    float chroma_crosstalk = 0.2f;
+    float inter_field_phase_error = 0.1f;
+    float head_pre_echo = 0.0f;
+    float drum_eccentricity = 0.0f;
 };
 
 class NTSCSimulator {
@@ -272,6 +291,14 @@ public:
     // and mechanical resonances.
     float wow_phase_[3]   = {0.0f, 0.0f, 0.0f};   // 0.3 Hz, 0.8 Hz, 2.1 Hz
     float flutter_phase_[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // 15, 23, 30, 46, 67 Hz
+
+    int prev_field_ = -1;
+    float field_chroma_phase_accum_ = 0.0f;
+    float head_switch_offset_ = 0.0f;
+    float drum_ecc_phase_ = 0.0f;
+    float adjacent_track_phase_ = 0.0f;
+    float prev_line_luma_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
     void initBuffers(int w, int h) {
         W_ = w;
         H_BLANK = 144;
@@ -297,6 +324,14 @@ public:
         float demag_deg = std::clamp(vp.demagnetization, 0.0f, 1.0f);
         float sticky_deg = std::clamp(vp.sticky_shed, 0.0f, 1.0f);
         float age_deg = std::clamp(vp.tape_age, 0.0f, 1.0f);
+
+        float helical_sweep_deg = std::clamp(vp.helical_sweep, 0.0f, 1.0f);
+        float head_switch_jitter_deg = std::clamp(vp.head_switch_jitter, 0.0f, 1.0f);
+        float fm_carrier_noise_deg = std::clamp(vp.fm_carrier_noise, 0.0f, 1.0f);
+        float chroma_crosstalk_deg [[maybe_unused]] = std::clamp(vp.chroma_crosstalk, 0.0f, 1.0f);
+        float inter_field_phase_deg = std::clamp(vp.inter_field_phase_error, 0.0f, 1.0f);
+        float head_pre_echo_deg [[maybe_unused]] = std::clamp(vp.head_pre_echo, 0.0f, 1.0f);
+        float drum_ecc_deg = std::clamp(vp.drum_eccentricity, 0.0f, 1.0f);
 
         float rf_level = 1.0f - tracking_deg * 0.7f
                                - dropout_deg * 0.3f
@@ -583,12 +618,31 @@ public:
         float crinkle_band = 10.0f + 55.0f * crease_deg;
         float crinkle_strength = crinkle_strength_lpf_;
 
+        int currentField = (frameNum % 2);
+        if (currentField != prev_field_) {
+            std::mt19937 fieldRng(uint32_t(frameNum) * 13u);
+            float phase_drift = std::normal_distribution<float>(0, inter_field_phase_deg * 0.06f)(fieldRng);
+            field_chroma_phase_accum_ = field_chroma_phase_accum_ * 0.92f + phase_drift;
+            if (head_switch_jitter_deg > 0.01f) {
+                head_switch_offset_ = std::normal_distribution<float>(0, head_switch_jitter_deg * 3.0f)(fieldRng);
+            } else {
+                head_switch_offset_ = 0.0f;
+            }
+            prev_field_ = currentField;
+        }
+        drum_ecc_phase_ = std::fmod(drum_ecc_phase_ + wallDt * 30.0f, 1.0f);
+        float drum_ecc_wobble = drum_ecc_deg * std::sin(drum_ecc_phase_ * 2.0f * kPI) * 2.0f;
+        adjacent_track_phase_ = std::fmod(adjacent_track_phase_ + wallDt * 0.1f, 1.0f);
+
+        float head_sweep_px_per_line = helical_sweep_deg * 1.5f;
+        float head_sweep_grad = head_sweep_px_per_line / float(W);
+        float hsw_boundary_y = float(H) - 7.0f * float(H) / 240.0f + head_switch_offset_;
+
         out.create(H, W, CV_8UC3);
 
 #ifdef ADO_OPENMP
 #pragma omp parallel
         {
-            // Per-thread composite line buffer to avoid cross-line data races.
             std::vector<float> comp_line;
             comp_line.resize(W_TOTAL);
 #pragma omp for schedule(dynamic, 16)
@@ -675,33 +729,42 @@ public:
                     drum_wobble_tbe = drum_wobble_amp * std::sin(drum_wobble_phase + float(y) * 0.05f);
                 }
 
-                // Add motor artifacts to the total horizontal warp
                 total_h_warp += drum_wobble_tbe;
 
+                float drum_ecc_offset = drum_ecc_wobble * std::sin(float(y) * 0.03f + drum_ecc_phase_ * 2.0f * kPI);
+                total_h_warp += drum_ecc_offset;
+
                 // --- D. Head Switch Noise (VHS Tearing at bottom of VBI) ---
-                // Motor degradation makes head switching unstable because
-                // the drum speed varies. This causes the VBI tear to wander
-                // and become more violent.
                 float hsTearing = 0.0f;
-                // Bad motors shift the head switch point vertically
                 float hs_line_offset = motor_defect * 12.0f *
                     std::sin(tapeTime_ * 1.5f * 2.0f * kPI);
                 int hs_start = std::max(0, H - 24 + int(hs_line_offset));
+
+                float dist_to_hsw = float(y) - hsw_boundary_y;
+                if (dist_to_hsw > -3.0f && dist_to_hsw < 8.0f) {
+                    float hsw_intensity = 0.0f;
+                    if (dist_to_hsw < 0.0f) {
+                        hsw_intensity = std::pow(1.0f + dist_to_hsw / 3.0f, 2.0f);
+                    } else {
+                        hsw_intensity = std::exp(-dist_to_hsw * 0.5f);
+                    }
+                    hsw_intensity *= head_switch_jitter_deg;
+                    float hsw_shear = hsw_intensity * 25.0f * std::sin(float(y) * 1.7f + tapeTime_ * 120.0f);
+                    float hsw_noise = hsw_intensity * std::normal_distribution<float>(0, 0.4f)(rng);
+                    hsTearing += hsw_shear + hsw_noise * 10.0f;
+                    total_h_warp += hsw_shear * 0.3f;
+                }
+
                 if (y >= hs_start) {
                     float hsDepth = (float(y) - float(hs_start)) / 24.0f;
-                    // Bad motors make the head switch more violent
                     float hs_gain = 35.0f + motor_defect * 25.0f;
-                    hsTearing = std::pow(hsDepth, 3.5f) * hs_gain;
-                    // Violent jitter at the very edge (bottom 3 lines)
-                    // Bad motors make this much worse
+                    hsTearing += std::pow(hsDepth, 3.5f) * hs_gain;
                     if (y >= H-3) hsTearing += std::normal_distribution<float>(0, 8 + motor_defect * 20)(rng);
                 }
 
-                // Motor vibration adds high-frequency noise to tracking
-                // This causes "fizz" or "hash" on the RF signal
                 float motor_rf_noise = 0.0f;
                 if (motor_defect > 0.05f) {
-                    motor_rf_noise = motor_vibration * 0.05f;  // Small but visible as noise
+                    motor_rf_noise = motor_vibration * 0.05f;
                 }
 
                 // --- Massive H-SYNC Roll & Tracking Shear ---
@@ -792,15 +855,14 @@ public:
                 float flutter_bend = flutter_dev * float(W) * 0.08f * bend_fraction;  // up to ±0.4 px
                 tbe_start += wow_bend + flutter_bend;
                 
-                // Stretch/squash line internally: simulates tape speed variation
-                // *within* a single scanline (real VHS tape stretches under tension)
                 float tbe_slope = scrape_flutter * 0.25f;
                 tbe_slope += crease_slope;
 
                 if (dy > 0.0f && dy < 100.0f) {
-                    // Huge stretch/squash during the motor snap
                     tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 25.0f);
                 }
+
+                tbe_slope += head_sweep_grad;
 
                 const float linePhase = fPhase + float(y) * kPI;
 
@@ -824,6 +886,9 @@ public:
                     std::normal_distribution<float>(0.0f, 1.0f)(rng);
 
                 // --- ENCODE ---
+                float field_phase_offset = inter_field_phase_deg * 0.15f * float(currentField);
+                float field_chroma_error = field_chroma_phase_accum_;
+                float fm_noise_lpf = 0.0f;
                 float d_tail = 0.0f;
 
                 // ── Oxide Dropout Scheduling ────────────────────────────────
@@ -860,7 +925,7 @@ public:
                     // The VCR handles subcarrier frequency conversion internally.
                     // We encode at the nominal 227.5 cycles/line with tiny
                     // per-line phase offsets simulating mechanical residuals.
-                    float theta = linePhase + xSrc * kSC_PX + line_wow_offset;
+                    float theta = linePhase + xSrc * kSC_PX + line_wow_offset + field_phase_offset;
 
                     float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -870,9 +935,8 @@ public:
                         Y = 0.0f;  // Burst
                         I = 0.0f; Q = 0.35f;
                     } else if (xSrc >= H_BLANK) {
-                        // Signal Dropout logic with tail recovery
                         if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.05f) {
-                            d_tail = 1.0f; // Snap to white/black dropout
+                            d_tail = 1.0f;
                         }
                         
                         float vX = std::clamp(xSrc - H_BLANK, 0.f, float(W - 1.001f));
@@ -894,40 +958,40 @@ public:
                         if (motor_defect > 0.05f) {
                             Y += motor_rf_noise * 0.03f;
                         }
+
+                        if (fm_carrier_noise_deg > 0.005f) {
+                            float fm_dev = fm_carrier_noise_deg * 0.012f;
+                            fm_noise_lpf += fm_dev * (std::uniform_real_distribution<float>(-1, 1)(rng) - fm_noise_lpf);
+                            Y += fm_noise_lpf * 0.3f;
+                            float fm_chroma_mod = fm_noise_lpf * 0.15f;
+                            I += fm_chroma_mod * std::cos(theta * 0.5f);
+                            Q += fm_chroma_mod * std::sin(theta * 0.5f);
+                        }
                         
                         if (d_tail > 0.01f) {
-                            // Dropout effect: high-luma 'spark' followed by darkened tail
                             Y = Y * (1.0f - d_tail) + (d_tail > 0.8f ? 0.8f : -0.2f);
                             I *= (1.0f - d_tail); Q *= (1.0f - d_tail);
-                            d_tail *= 0.92f; // Decay tail
+                            d_tail *= 0.92f;
                         }
                     }
                     if (tracking_rf < 0.95f && xSrc >= H_BLANK) {
                          Y *= tracking_rf; I *= tracking_rf; Q *= tracking_rf;
                          float noise_amp = 1.0f - tracking_rf;
-                         // Denser noise with higher frequency feel
                          Y += std::uniform_real_distribution<float>(-0.8f, 0.8f)(rng) * noise_amp;
                          if (noise_amp > 0.35f) { I *= 0.2f; Q *= 0.2f; }
                     }
 
-                    // ── Oxide Dropout: signal goes to black/static ───────────
-                    // During a dropout event, the RF signal is lost.
-                    // Creates black spots with white edge "sparkle" — the classic
-                    // VHS dropout look.
                     if (dropout_active) {
                         float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
                         if (dist_to_dropout < dropout_duration * 0.5f) {
-                            // Inside the dropout region
                             float edge_dist = std::min(
                                 std::abs(dist_to_dropout - dropout_duration * 0.5f + 3.0f),
                                 std::abs(dist_to_dropout + dropout_duration * 0.5f - 3.0f)
                             );
                             if (edge_dist < 3.0f) {
-                                // Edge sparkle: white flash at dropout boundaries
                                 Y = 1.0f + std::uniform_real_distribution<float>(-0.3f, 0.5f)(rng);
                                 I = 0.0f; Q = 0.0f;
                             } else {
-                                // Core dropout: black or very dark noise
                                 Y = -0.1f + std::uniform_real_distribution<float>(0, 1)(rng) * 0.15f;
                                 I = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
                                 Q = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
@@ -941,9 +1005,6 @@ public:
                 // --- DECODE (Closed-Loop PLL) ---
                 float phase_accum = 0.0f;
 
-                // Burst is encoded as Q=0.35, so the measured burst angle is always
-                // atan2(positive,0) = π/2. Subtract the expected reference so the
-                // net correction is 0 when encode and decode are synchronized.
                 float sumI = 0.f, sumQ = 0.f;
                 for (int x = 70; x < 110; ++x) {
                     float refTheta = linePhase + float(x) * kSC_PX;
@@ -952,13 +1013,8 @@ public:
                 }
                 phase_accum = std::atan2(sumQ, sumI) - (kPI / 2.0f);
 
-                // --- TBC FAILURE (Loss of Color Lock) ---
-                // Wow/flutter degrade the PLL's ability to maintain color lock.
-                // Real VHS color PLL has limited capture range (~±30 degrees)
-                // and response bandwidth (~10 Hz). Fast flutter exceeds this.
-                // The wow/flutter residuals are very small (sub-degree), so
-                // the PLL handles most of it fine — only extreme flutter
-                // causes noticeable instability.
+                phase_accum += field_chroma_error;
+
                 float wow_flutter_phase_error = std::abs(line_wow_offset) + std::abs(line_flutter_base);
                 float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f
                                       + ep.flutter_dep * 0.15f
@@ -971,7 +1027,6 @@ public:
                 pll_instability += unlock * 0.9f;
                 float pll_drift_accum = 0.0f;
 
-                // Demodulation variables
                 float lpY = 0.f, si = 0.f, sq = 0.f;
                 const float lpfA = 0.35f;
                 const float chrA = 0.12f;
@@ -982,24 +1037,14 @@ public:
                     int x = out_x + H_BLANK;
                     float sig = comp_line[x];
 
-                    // ── Within-line flutter (active video only) ──────────────
-                    // Real VHS tape flutter varies WITHIN a scanline because
-                    // tape elasticity causes micro-speed variations.
-                    // The burst gate (pixels 70-110) measures the average phase,
-                    // but the active video region has different instantaneous
-                    // phase. This creates very subtle VHS chroma "swim"
-                    // where colors shift slightly across the image.
-                    float x_norm = float(out_x) / float(W);  // 0..1 across active video
+                    float x_norm = float(out_x) / float(W);
                     float within_line_flutter = line_flutter_base *
                         (0.5f + 0.5f * std::sin(x_norm * 12.0f + wallTime_ * 37.0f));
 
-                    // 1. Adaptive Phase Tracking Simulation
                     pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
-                    // Decode: nominal subcarrier + burst correction + tiny within-line flutter error
                     float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum
-                                   + within_line_flutter;
+                                   + within_line_flutter + field_phase_offset;
 
-                    // 2. Extract Luma
                     lpY += lpfA * (sig - lpY);
 
                     // 3. Demodulate Chroma
@@ -1045,9 +1090,11 @@ public:
             }
         }
 #else
-        // Single-threaded fallback uses a single composite line buffer.
-        std::vector<float> comp_line;
-        comp_line.resize(W_TOTAL);
+        std::vector<float> prev_comp_line;
+        prev_comp_line.resize(W_TOTAL, 0.0f);
+        std::vector<float> curr_comp_line;
+        curr_comp_line.resize(W_TOTAL, 0.0f);
+        bool first_line = true;
         for (int y = 0; y < H; ++y) {
             std::mt19937 rng(uint32_t(frameNum) * 65537u + uint32_t(y) * 1013u);
             int src_y = (y + v_roll) % H;
@@ -1117,20 +1164,37 @@ public:
             }
             total_h_warp += drum_wobble_tbe;
 
+            float drum_ecc_offset = drum_ecc_wobble * std::sin(float(y) * 0.03f + drum_ecc_phase_ * 2.0f * kPI);
+            total_h_warp += drum_ecc_offset;
+
             // --- D. Head Switch Noise (VHS Tearing at bottom of VBI) ---
-            // Motor degradation makes head switching unstable
             float hsTearing = 0.0f;
             float hs_line_offset = motor_defect * 12.0f *
                 std::sin(tapeTime_ * 1.5f * 2.0f * kPI);
             int hs_start = std::max(0, H - int(kHS_VBI_LINES) + int(hs_line_offset));
+
+            float dist_to_hsw = float(y) - hsw_boundary_y;
+            if (dist_to_hsw > -3.0f && dist_to_hsw < 8.0f) {
+                float hsw_intensity = 0.0f;
+                if (dist_to_hsw < 0.0f) {
+                    hsw_intensity = std::pow(1.0f + dist_to_hsw / 3.0f, 2.0f);
+                } else {
+                    hsw_intensity = std::exp(-dist_to_hsw * 0.5f);
+                }
+                hsw_intensity *= head_switch_jitter_deg;
+                float hsw_shear = hsw_intensity * 25.0f * std::sin(float(y) * 1.7f + tapeTime_ * 120.0f);
+                float hsw_noise = hsw_intensity * std::normal_distribution<float>(0, 0.4f)(rng);
+                hsTearing += hsw_shear + hsw_noise * 10.0f;
+                total_h_warp += hsw_shear * 0.3f;
+            }
+
             if (y >= hs_start) {
                 float hsDepth = (float(y) - float(hs_start)) / float(kHS_VBI_LINES);
                 float hs_gain = 12.0f + motor_defect * 20.0f;
-                hsTearing = std::pow(hsDepth, 2.0f) * hs_gain;
+                hsTearing += std::pow(hsDepth, 2.0f) * hs_gain;
                 hsTearing += std::normal_distribution<float>(0, 1 + motor_defect * 8)(rng);
             }
 
-            // Motor vibration RF noise
             float motor_rf_noise = 0.0f;
             if (motor_defect > 0.05f) {
                 motor_rf_noise = motor_vibration * 0.05f;
@@ -1207,9 +1271,10 @@ public:
             float tbe_slope = scrape_flutter * 0.25f;
             tbe_slope += crease_slope;
             if (dy > 0.0f && dy < 100.0f) {
-                // Huge stretch/squash during the motor snap
                 tbe_slope += std::exp(-dy * 0.05f) * std::cos(dy * 0.2f) * (ep.motor_drag * 25.0f);
             }
+
+            tbe_slope += head_sweep_grad;
 
             const float linePhase = fPhase + float(y) * kPI;
 
@@ -1222,6 +1287,11 @@ public:
                 std::normal_distribution<float>(0.0f, 1.0f)(rng);
 
             // --- ENCODE ---
+            float field_phase_offset = inter_field_phase_deg * 0.15f * float(currentField);
+            float field_chroma_error = field_chroma_phase_accum_;
+            float fm_noise_lpf = 0.0f;
+            float d_tail = 0.0f;
+
             // Oxide dropout scheduling for single-threaded path
             float dropout_active = false;
             float dropout_duration = 0.0f;
@@ -1242,8 +1312,7 @@ public:
                 float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                 float xSrc = (float)x - current_tbe;
 
-                // Encode at nominal subcarrier frequency with tiny per-line offset
-                float theta = linePhase + xSrc * kSC_PX + line_wow_offset;
+                float theta = linePhase + xSrc * kSC_PX + line_wow_offset + field_phase_offset;
 
                 float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -1253,6 +1322,10 @@ public:
                     Y = 0.0f;  // Burst
                     I = 0.0f; Q = 0.35f;
                 } else if (xSrc >= H_BLANK) {
+                    if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.05f) {
+                        d_tail = 1.0f;
+                    }
+
                     float vX = std::clamp(xSrc - H_BLANK, 0.f, float(W - 1.001f));
                     int x0 = (int)vX;
                     float r = sr[x0 * 3 + 2] / 255.f;
@@ -1272,6 +1345,37 @@ public:
                     if (motor_defect > 0.05f) {
                         Y += motor_rf_noise * 0.03f;
                     }
+
+                    if (fm_carrier_noise_deg > 0.005f) {
+                        float fm_dev = fm_carrier_noise_deg * 0.012f;
+                        fm_noise_lpf += fm_dev * (std::uniform_real_distribution<float>(-1, 1)(rng) - fm_noise_lpf);
+                        Y += fm_noise_lpf * 0.3f;
+                        float fm_chroma_mod = fm_noise_lpf * 0.15f;
+                        I += fm_chroma_mod * std::cos(theta * 0.5f);
+                        Q += fm_chroma_mod * std::sin(theta * 0.5f);
+                    }
+
+                    if (chroma_crosstalk_deg > 0.005f && !first_line) {
+                        float crosstalk_amp = chroma_crosstalk_deg * 0.12f;
+                        float crosstalk_offset = kVHS_CHROMA_SHIFT / kSC_FREQ;
+                        int adj_x = std::clamp(x + int(crosstalk_offset * 4.0f), 0, W_TOTAL - 1);
+                        float adj_sig = prev_comp_line[adj_x];
+                        float adj_chroma = adj_sig - prev_line_luma_[std::min(3, x0 % 4)];
+                        float ct_phase = theta + crosstalk_offset * kSC_PX;
+                        float ct_I = 2.0f * adj_chroma * std::cos(ct_phase) * crosstalk_amp;
+                        float ct_Q = -2.0f * adj_chroma * std::sin(ct_phase) * crosstalk_amp;
+
+                        float beat_freq = std::fmod(float(y) / 40.0f, 1.0f);
+                        float beat_env = 0.5f + 0.5f * std::cos(beat_freq * 2.0f * kPI);
+                        I += ct_I * beat_env;
+                        Q += ct_Q * beat_env;
+                    }
+
+                    if (d_tail > 0.01f) {
+                        Y = Y * (1.0f - d_tail) + (d_tail > 0.8f ? 0.8f : -0.2f);
+                        I *= (1.0f - d_tail); Q *= (1.0f - d_tail);
+                        d_tail *= 0.92f;
+                    }
                 }
                 if (tracking_rf < 0.95f && xSrc >= H_BLANK) {
                      float noise_thresh = tracking_rf * tracking_rf;
@@ -1279,17 +1383,8 @@ public:
                           Y = std::uniform_real_distribution<float>(-0.2f, 1.0f)(rng);
                           I = 0.0f; Q = 0.0f; // Pure uncolored noise
                      }
-                }
+                 }
 
-                if (crease_dropout_prob > 0.001f && xSrc >= H_BLANK) {
-                    if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.045f) {
-                        Y = -0.12f + std::uniform_real_distribution<float>(0.0f, 0.18f)(rng);
-                        I *= 0.2f;
-                        Q *= 0.2f;
-                    }
-                }
-
-                // Oxide dropout: signal goes to black/static
                 if (dropout_active) {
                     float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
                     if (dist_to_dropout < dropout_duration * 0.5f) {
@@ -1308,22 +1403,39 @@ public:
                     }
                 }
 
-                comp_line[x] = Y + I * std::cos(theta) - Q * std::sin(theta);
+                if (head_pre_echo_deg > 0.005f && xSrc >= H_BLANK && !first_line) {
+                    float echo_delay = 3.0f + helical_sweep_deg * 4.0f;
+                    int echo_x = std::clamp(x - int(echo_delay), 0, W_TOTAL - 1);
+                    float echo_sig = prev_comp_line[echo_x];
+                    float echo_amp = head_pre_echo_deg * 0.06f;
+                    Y += (echo_sig - 0.3f) * echo_amp;
+                }
+
+                curr_comp_line[x] = Y + I * std::cos(theta) - Q * std::sin(theta);
+            }
+
+            {
+                float sumLuma = 0.0f;
+                for (int x = H_BLANK; x < W_TOTAL; ++x) sumLuma += curr_comp_line[x];
+                prev_line_luma_[0] = prev_line_luma_[1];
+                prev_line_luma_[1] = prev_line_luma_[2];
+                prev_line_luma_[2] = prev_line_luma_[3];
+                prev_line_luma_[3] = sumLuma / float(W_TOTAL - H_BLANK);
             }
 
             // --- DECODE (Closed-Loop PLL) ---
             float phase_accum = 0.0f;
 
-            // Same burst reference correction for single-threaded path.
             float sumI = 0.f, sumQ = 0.f;
             for (int x = 70; x < 110; ++x) {
                 float refTheta = linePhase + float(x) * kSC_PX;
-                sumI += comp_line[x] * std::cos(refTheta);
-                sumQ -= comp_line[x] * std::sin(refTheta);
+                sumI += curr_comp_line[x] * std::cos(refTheta);
+                sumQ -= curr_comp_line[x] * std::sin(refTheta);
             }
             phase_accum = std::atan2(sumQ, sumI) - (kPI / 2.0f);
 
-            // --- TBC FAILURE (Loss of Color Lock) ---
+            phase_accum += field_chroma_error;
+
             float wow_flutter_phase_error = std::abs(line_wow_offset) + std::abs(line_flutter_base);
             float pll_instability = std::max(0.0f, std::abs(beltSlip) - 2.0f) * 0.05f
                                   + ep.flutter_dep * 0.15f
@@ -1345,21 +1457,17 @@ public:
             bool has_prev = false;
             for (int out_x = 0; out_x < W; ++out_x) {
                 int x = out_x + H_BLANK;
-                float sig = comp_line[x];
+                float sig = curr_comp_line[x];
 
-                // 1. Adaptive Phase Tracking Simulation
                 pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
 
-                // Within-line flutter (active video only)
                 float x_norm = float(out_x) / float(W);
                 float within_line_flutter = line_flutter_base *
                     (0.5f + 0.5f * std::sin(x_norm * 12.0f + wallTime_ * 37.0f));
 
-                // Decode: nominal subcarrier + burst correction + within-line flutter error
                 float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum
-                               + within_line_flutter;
+                               + within_line_flutter + field_phase_offset;
 
-                // 2. Extract Luma
                 lpY += lpfA * (sig - lpY);
 
                 // 3. Demodulate Chroma
@@ -1402,6 +1510,9 @@ public:
                 dr[out_x * 3 + 1] = (uchar)std::clamp(g * 255.f, 0.f, 255.f);
                 dr[out_x * 3 + 2] = (uchar)std::clamp(r * 255.f, 0.f, 255.f);
             }
+
+            std::swap(prev_comp_line, curr_comp_line);
+            first_line = false;
         }
 #endif
     }
@@ -1683,15 +1794,7 @@ private:
                     int64_t latencyComp = int64_t(syncOffset * AUDIO_SR / 1000.0f);
                     int64_t adjApos = std::max((int64_t)0, g_audioSamplePos.load() - latencyComp);
 
-                    // Retrieve the precise speed that was active when this audio was generated
-                    float histSpd = spd; // fallback to latest
-                    if (pp.engValid.load() && pp.exPtr && pp.exPtr->tapeEnginePtr) {
-                        uint64_t idx = uint64_t(adjApos) % TransportDynamics::SPEED_HIST_SIZE;
-                        histSpd = pp.exPtr->tapeEnginePtr->transport.speed_history[idx];
-                        // Guard against NaN/Inf from uninitialized history
-                        if (!std::isfinite(histSpd)) histSpd = spd;
-                    }
-
+                    float histSpd = spd;
                     ntsc_.tapeTime_ = (float)adjApos / AUDIO_SR;
                     ntsc_.process(eff,proc,frameNum_,ep,vp,spd,histSpd,wallDt);
                 }}
@@ -2341,9 +2444,19 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     sl3("HF CUTOFF",&bp.cutoff_base,1000,20000);
     ImGui::EndDisabled();
 
+    sectionHdr("HELICAL SCAN");
+    ImGui::BeginDisabled(!hasTapeEngine);
+    sl3("HEAD SWEEP",&app.videoParams.helical_sweep,0,1);
+    sl3("HS JITTER",&app.videoParams.head_switch_jitter,0,1);
+    sl3("FM CARRIER NOISE",&app.videoParams.fm_carrier_noise,0,1);
+    sl3("CHROMA XTALK",&app.videoParams.chroma_crosstalk,0,1);
+    sl3("FIELD PHASE ERR",&app.videoParams.inter_field_phase_error,0,1);
+    sl3("HEAD PRE-ECHO",&app.videoParams.head_pre_echo,0,1);
+    sl3("DRUM ECCENTRIC",&app.videoParams.drum_eccentricity,0,1);
+    ImGui::EndDisabled();
+
     {
         std::lock_guard<std::mutex> lk2(app.pp.mu);
-        bp.tracking_error = app.videoParams.tracking_error; // Link to audio engine
         app.pp.epSnap=bp;
         app.pp.vpSnap=app.videoParams;
         app.pp.tapeSpd=bp.tape_speed_mult;
@@ -2368,11 +2481,11 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     struct PR{const char*n;std::function<void(EngineParams&,VideoParams&)>fn;};
     static const PR prs[]={
         {"CLEAN DIGITAL",[](EngineParams&p,VideoParams&v){p={};p.ips_base=15;p.cutoff_base=20000;v={};}},
-        {"VHS  SP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=15;p.wow_dep=.5f;p.flutter_dep=.15f;p.head_bump=.4f;p.cutoff_base=12000;p.hiss=.003f;v={};}},
-        {"VHS  LP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=7.5f;p.wow_dep=1.5f;p.flutter_dep=.3f;p.head_bump=.6f;p.cutoff_base=8000;p.hiss=.006f;p.hiss_color=.15f;v={};}},
-        {"VHS  EP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=3.75f;p.wow_dep=3.f;p.flutter_dep=.6f;p.head_bump=.8f;p.cutoff_base=5000;p.hiss=.01f;p.hiss_color=.25f;v={};v.demagnetization=.4f;v.motor_health=.6f;}},
-        {"WORN  EP",     [](EngineParams&p,VideoParams&v){p={};p.ips_base=3.75f;p.wow_dep=4.f;p.flutter_dep=.8f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.35f;p.mains_hum=.015f;v={};v.sticky_shed=.08f;v.dropout_rate=.05f;v.demagnetization=.7f;v.motor_health=.75f;}},
-        {"DEGRADED",     [](EngineParams&p,VideoParams&v){p={};p.ips_base=7.5f;p.wow_dep=4.f;p.flutter_dep=.8f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.3f;p.mains_hum=.025f;v={};v.sticky_shed=.08f;v.dropout_rate=.05f;v.demagnetization=.7f;v.motor_health=.8f;v.oxide_shedding=.3f;}},
+        {"VHS  SP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=15;p.wow_dep=.5f;p.flutter_dep=.15f;p.head_bump=.4f;p.cutoff_base=12000;p.hiss=.003f;v={};v.helical_sweep=.5f;v.head_switch_jitter=.15f;v.fm_carrier_noise=.08f;v.chroma_crosstalk=.12f;v.inter_field_phase_error=.06f;v.head_pre_echo=.02f;}},
+        {"VHS  LP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=7.5f;p.wow_dep=1.5f;p.flutter_dep=.3f;p.head_bump=.6f;p.cutoff_base=8000;p.hiss=.006f;p.hiss_color=.15f;v={};v.helical_sweep=.55f;v.head_switch_jitter=.25f;v.fm_carrier_noise=.15f;v.chroma_crosstalk=.22f;v.inter_field_phase_error=.1f;v.head_pre_echo=.04f;}},
+        {"VHS  EP",      [](EngineParams&p,VideoParams&v){p={};p.ips_base=3.75f;p.wow_dep=3.f;p.flutter_dep=.6f;p.head_bump=.8f;p.cutoff_base=5000;p.hiss=.01f;p.hiss_color=.25f;v={};v.demagnetization=.4f;v.motor_health=.6f;v.helical_sweep=.65f;v.head_switch_jitter=.35f;v.fm_carrier_noise=.25f;v.chroma_crosstalk=.35f;v.inter_field_phase_error=.18f;v.head_pre_echo=.06f;v.drum_eccentricity=.1f;}},
+        {"WORN  EP",     [](EngineParams&p,VideoParams&v){p={};p.ips_base=3.75f;p.wow_dep=4.f;p.flutter_dep=.8f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.35f;p.mains_hum=.015f;v={};v.sticky_shed=.08f;v.dropout_rate=.05f;v.demagnetization=.7f;v.motor_health=.75f;v.helical_sweep=.75f;v.head_switch_jitter=.5f;v.fm_carrier_noise=.35f;v.chroma_crosstalk=.45f;v.inter_field_phase_error=.25f;v.head_pre_echo=.08f;v.drum_eccentricity=.2f;}},
+        {"DEGRADED",     [](EngineParams&p,VideoParams&v){p={};p.ips_base=7.5f;p.wow_dep=4.f;p.flutter_dep=.8f;p.cutoff_base=3000;p.hiss=.015f;p.hiss_color=.3f;p.mains_hum=.025f;v={};v.sticky_shed=.08f;v.dropout_rate=.05f;v.demagnetization=.7f;v.motor_health=.8f;v.oxide_shedding=.3f;v.helical_sweep=.7f;v.head_switch_jitter=.45f;v.fm_carrier_noise=.3f;v.chroma_crosstalk=.4f;v.inter_field_phase_error=.2f;v.head_pre_echo=.07f;v.drum_eccentricity=.15f;}},
     };
     for(auto&pr:prs){
         if(ImGui::Button(pr.n,{colW-18,0})){
@@ -2529,13 +2642,11 @@ int main(int,char**){
         
         auto aio=std::make_unique<AudioIO>(*eng);
         if(!aio->open()){ SDL_Log("AudioIO: Failed to open"); return; }
-        aio->play_forward(); eng->is_playing.store(true);
-        
-        // Set the global capture callback
-        aio->set_capture_callback([&app](const std::vector<float>& samples){
+        aio->set_capture_callback([&app](const std::vector<float>& samples) {
             app.audioCaptureQ.push(samples);
         });
-
+        aio->play_forward(); eng->is_playing.store(true);
+        
         {
             std::lock_guard<std::mutex> lk(app.audioMu);
             // Safely stop and replace the current engine/IO
