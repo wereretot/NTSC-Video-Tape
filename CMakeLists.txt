@@ -59,6 +59,7 @@ set(CAPSTANVAR_SRC
 
 add_executable(ado8500
     src/main.cpp
+    src/crt_tv.cpp
     ${IMGUI_SRC}
     ${CAPSTANVAR_SRC}
 )

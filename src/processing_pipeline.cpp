@@ -44,8 +44,9 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
 
         auto now_time = std::chrono::steady_clock::now();
         long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now_time - loop_timer).count();
-        if (elapsed < 32) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        float target_frame_ms = 1000.f / std::max(15.f, g_sourceFPS.load());
+        if (elapsed < long long(target_frame_ms - 1.f)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
         loop_timer = now_time;

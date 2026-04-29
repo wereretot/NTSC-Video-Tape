@@ -13,9 +13,8 @@
 //  NTSC geometric distortion (NTSCSimulator). They share the
 //  same scalar — they cannot desync.
 //
-//  All NTSC distortion oscillators run off `simTime` which is
-//  frameNum × (1/29.97) × tapeSpd — i.e. they move at exactly
-//  the same speed as the audio.
+//  All NTSC distortion oscillators run off wall-clock / tape time.
+//  The processing path presents alternating fields at 59.94 Hz.
 //
 //  ── Analog NTSC Composite Signal Simulation ──────────────────────────
 //
@@ -102,6 +101,8 @@ extern "C" {
 #include <thread>
 #include <vector>
 
+#include "crt_tv.h"
+
 #ifdef ADO_OPENMP
 #  include <omp.h>
 #endif
@@ -112,6 +113,8 @@ extern "C" {
 
 static constexpr int   FW            = 640;
 static constexpr int   FH            = 480;
+static constexpr int   PROCESS_W     = 320;
+static constexpr int   PROCESS_H     = 240;
 static constexpr float ASPECT        = float(FW)/float(FH);
 static constexpr int   Q_DEPTH       = 4; // Low depth for live playback sync
 static constexpr int   AUDIO_SR     = 44100;
@@ -121,6 +124,8 @@ static constexpr float kSC_PX        = 2.f * 3.14159265f * 227.5f / float(FW);
 // NTSC timing — hard-locked, not configurable
 static constexpr float kNTSC_FPS     = 29.97f;       // 59.94 Hz field / 2
 static constexpr float kNTSC_FRAME_S = 1.f / kNTSC_FPS; // ~33.367 ms
+static constexpr float kNTSC_FIELD_HZ = kNTSC_FPS * 2.f; // 59.94 fields/sec
+static constexpr float kNTSC_FIELD_S  = 1.f / kNTSC_FIELD_HZ;
 static constexpr float kNTSC_HSYNC   = 15734.26f;    // Hz
 // Active lines of a 525-line NTSC frame (visible ≈ 480–486)
 static constexpr int   kNTSC_TOTAL_LINES = 525;
@@ -179,7 +184,7 @@ static std::string extractAudioToWav(const std::string& vp) {
 class DemoSource {
 public:
     cv::Mat generate(int w, int h) {
-        cv::Mat f(h,w,CV_8UC3); phase_+=.016f;
+        cv::Mat f(h,w,CV_8UC3); phase_+=.008f;
         static const cv::Scalar bars[]={{192,192,192},{192,192,0},{0,192,192},
             {0,192,0},{192,0,192},{192,0,0},{0,0,192}};
         int bw=w/7;
@@ -299,17 +304,51 @@ public:
     float adjacent_track_phase_ = 0.0f;
     float prev_line_luma_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+    // ── Fast noise buffer (replaces per-pixel RNG) ──────────
+    std::vector<float> noise_buf_;
+    int W_TOTAL_ = 0, H_ = 0;
+
+    static inline uint32_t xorshift32_(uint32_t& s) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s;
+    }
+    static inline float xrnd_(uint32_t& s) {
+        // uniform [-1, 1]
+        return (float)(xorshift32_(s) >> 8) * (1.f / 16777216.f) - 1.f;
+    }
+    // Box-Muller using two uniform samples — Gaussian with sigma≈0.8
+    static inline float xgauss_(uint32_t& s) {
+        float u = (float)(xorshift32_(s) >> 8) * (1.f / 16777216.f) + 1e-7f;
+        float v = (float)(xorshift32_(s) >> 8) * (1.f / 16777216.f);
+        return std::sqrt(-2.f * std::log(u)) * std::cos(2.f * 3.14159265f * v);
+    }
+
     void initBuffers(int w, int h) {
         W_ = w;
         H_BLANK = 144;
         W_TOTAL = w + H_BLANK;
+        W_TOTAL_ = W_TOTAL;
+        H_ = h;
         kSC_PX = (2.0f * kPI * kSC_FREQ) / (float)W_;
+        noise_buf_.resize(W_TOTAL * h);
+        phosphor_buffer_.create(h, w, CV_32FC3);
+        phosphor_buffer_.setTo(cv::Scalar(0, 0, 0));
     }
 
-    void process(const cv::Mat& in, cv::Mat& out, int frameNum, const EngineParams& ep, const VideoParams& vp, float tapeSpd, float instantSpd, float wallDt) {
+    void applyCRTOutput(const cv::Mat& in, cv::Mat& out, const TVParams& tv, int frameNum) {
+        ::applyCRTOutput(in, out, tv, frameNum, wallTime_, noise_buf_, W_TOTAL_, phosphor_buffer_);
+    }
+
+    void process(const cv::Mat& in, cv::Mat& out, int frameNum, const EngineParams& ep, const VideoParams& vp, const TVParams& tv, float tapeSpd, float instantSpd, float wallDt) {
         const int W = in.cols, H = in.rows;
         if (W == 0 || H == 0) { SDL_Log("[NTSC] CRASH GUARD: empty input frame %d", frameNum); return; }
-        if (W != W_) initBuffers(W, H);
+        if (W != W_ || H != H_) initBuffers(W, H);
+
+        // Fill noise buffer once per frame — eliminates ~960 mt19937 seedings
+        // and all per-pixel normal_distribution calls in the hot path.
+        {
+            uint32_t ns = uint32_t(frameNum) * 2654435761u ^ 40503u;
+            for (float& v : noise_buf_) v = xgauss_(ns);
+        }
 
         // Read absolute wall-clock time directly. All oscillators are computed
         // from this value — NOTHING is accumulated per frame, so tape speed
@@ -464,7 +503,7 @@ public:
         float v_jitter = 0.0f;
         if (target_error > 0.1f || unlock > 0.05f) {
             std::mt19937 jRng(uint32_t(frameNum) * 999u);
-            v_jitter = std::normal_distribution<float>(0, target_error * 10.0f + unlock * 14.0f)(jRng);
+            v_jitter = std::normal_distribution<float>(0, std::max<float>(1e-6f, target_error * 10.0f + unlock * 14.0f))(jRng);
         }
 
         int v_roll = (int(v_roll_accum_ + v_jitter)) % H;
@@ -621,10 +660,10 @@ public:
         int currentField = (frameNum % 2);
         if (currentField != prev_field_) {
             std::mt19937 fieldRng(uint32_t(frameNum) * 13u);
-            float phase_drift = std::normal_distribution<float>(0, inter_field_phase_deg * 0.06f)(fieldRng);
+            float phase_drift = std::normal_distribution<float>(0, std::max<float>(1e-6f, inter_field_phase_deg * 0.06f))(fieldRng);
             field_chroma_phase_accum_ = field_chroma_phase_accum_ * 0.92f + phase_drift;
             if (head_switch_jitter_deg > 0.01f) {
-                head_switch_offset_ = std::normal_distribution<float>(0, head_switch_jitter_deg * 3.0f)(fieldRng);
+                head_switch_offset_ = std::normal_distribution<float>(0, std::max<float>(1e-6f, head_switch_jitter_deg * 3.0f))(fieldRng);
             } else {
                 head_switch_offset_ = 0.0f;
             }
@@ -647,7 +686,9 @@ public:
             comp_line.resize(W_TOTAL);
 #pragma omp for schedule(dynamic, 16)
             for (int y = 0; y < H; ++y) {
+                // rng only used for rare/conditional distributions not in inner-x loop
                 std::mt19937 rng(uint32_t(frameNum) * 65537u + uint32_t(y) * 1013u);
+                const float* nb = noise_buf_.data() + y * W_TOTAL_;
                 int src_y = (y + v_roll) % H;
                 const uchar* sr = in.ptr(src_y);
                 uchar* dr = out.ptr(y);
@@ -663,7 +704,7 @@ public:
                 // Per-line FAST scrape flutter (high-frequency noise)
                 // Real VHS head-to-tape friction creates fine per-line jitter.
                 // This is SUBTLE — typically 0.1-0.5px RMS, not whole-pixel shifts.
-                float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 0.4f)(rng);
+                float scrape_flutter = nb[0] * ep.flutter_dep * 0.4f;
 
                 // AFC Pull-in: Error decays exponentially as TV catches sync.
                 // Real VHS PLL pull-in time constant is ~3-8 scanlines.
@@ -829,7 +870,7 @@ public:
                                          + std::cos(src_y * 0.35f - wallTime_ * 52.0f) * 0.5f
                                          + std::sin(src_y * 0.11f + wallTime_ * 19.0f) * 0.4f
                                          + std::sin(src_y * 0.47f - wallTime_ * 71.0f) * 0.25f
-                                         + std::normal_distribution<float>(0, 1)(rng) * 0.6f;
+                                         + nb[1] * 0.6f;
                      float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
                      h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * (rf_penalty + unlock * 1.4f);
                 }
@@ -880,10 +921,10 @@ public:
                 //
                 // Values are in radians. Max settings produce ~1-2° phase error.
                 float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + wallTime_ * 1.2f);
-                line_wow_offset += std::normal_distribution<float>(0.0f, demag_deg * 0.05f + unlock * 0.08f)(rng);
+                line_wow_offset += nb[2] * (demag_deg * 0.05f + unlock * 0.08f);
                 float line_flutter_base = flutter_dev * 0.008f *
                     std::sin(float(y) * 0.3f + wallTime_ * 47.0f) *
-                    std::normal_distribution<float>(0.0f, 1.0f)(rng);
+                    nb[3];
 
                 // --- ENCODE ---
                 float field_phase_offset = inter_field_phase_deg * 0.15f * float(currentField);
@@ -918,8 +959,8 @@ public:
                 for (int x = 0; x < W_TOTAL; ++x) {
                     float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                     float xSrc = (float)x - current_tbe;
-                    xSrc = std::fmod(xSrc, float(W_TOTAL));
-                    if (xSrc < 0.0f) xSrc += float(W_TOTAL);
+                    bool inLine = xSrc >= 0.0f && xSrc < float(W_TOTAL);
+                    bool activeSrc = inLine && xSrc >= H_BLANK && xSrc < float(H_BLANK + W);
 
                     // ── Encode at nominal subcarrier frequency ────────────────
                     // The VCR handles subcarrier frequency conversion internally.
@@ -929,12 +970,12 @@ public:
 
                     float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
-                    if (xSrc < 60) {
+                    if (inLine && xSrc < 60) {
                         Y = -0.3f; // Sync
-                    } else if (xSrc >= 70 && xSrc < 110) {
+                    } else if (inLine && xSrc >= 70 && xSrc < 110) {
                         Y = 0.0f;  // Burst
                         I = 0.0f; Q = 0.35f;
-                    } else if (xSrc >= H_BLANK) {
+                    } else if (activeSrc) {
                         if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.05f) {
                             d_tail = 1.0f;
                         }
@@ -974,14 +1015,14 @@ public:
                             d_tail *= 0.92f;
                         }
                     }
-                    if (tracking_rf < 0.95f && xSrc >= H_BLANK) {
+                    if (tracking_rf < 0.95f && activeSrc) {
                          Y *= tracking_rf; I *= tracking_rf; Q *= tracking_rf;
                          float noise_amp = 1.0f - tracking_rf;
                          Y += std::uniform_real_distribution<float>(-0.8f, 0.8f)(rng) * noise_amp;
                          if (noise_amp > 0.35f) { I *= 0.2f; Q *= 0.2f; }
                     }
 
-                    if (dropout_active) {
+                    if (dropout_active && activeSrc) {
                         float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
                         if (dist_to_dropout < dropout_duration * 0.5f) {
                             float edge_dist = std::min(
@@ -1041,7 +1082,7 @@ public:
                     float within_line_flutter = line_flutter_base *
                         (0.5f + 0.5f * std::sin(x_norm * 12.0f + wallTime_ * 37.0f));
 
-                    pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
+                    pll_drift_accum += nb[H_BLANK + out_x] * pll_instability;
                     float decTheta = linePhase + float(x) * kSC_PX + phase_accum + pll_drift_accum
                                    + within_line_flutter + field_phase_offset;
 
@@ -1060,7 +1101,7 @@ public:
                     float g = lpY - 0.272f * si - 0.647f * sq;
                     float b = lpY - 1.106f * si + 1.703f * sq;
 
-                    float snow = std::normal_distribution<float>(0.0f, wear_noise * 0.12f)(rng);
+                    float snow = noise_buf_[(H_ - 1 - y) * W_TOTAL_ + (W_TOTAL_ - 1 - out_x)] * (wear_noise * 0.12f);
                     r += snow;
                     g += snow;
                     b += snow;
@@ -1097,6 +1138,7 @@ public:
         bool first_line = true;
         for (int y = 0; y < H; ++y) {
             std::mt19937 rng(uint32_t(frameNum) * 65537u + uint32_t(y) * 1013u);
+            const float* nb = noise_buf_.data() + y * W_TOTAL_;
             int src_y = (y + v_roll) % H;
             const uchar* sr = in.ptr(src_y);
             uchar* dr = out.ptr(y);
@@ -1112,7 +1154,7 @@ public:
             // Per-line FAST scrape flutter (high-frequency noise)
             // Real VHS head-to-tape friction creates fine per-line jitter.
             // This is SUBTLE — typically 0.1-0.5px RMS, not whole-pixel shifts.
-            float scrape_flutter = std::normal_distribution<float>(0, ep.flutter_dep * 0.4f)(rng);
+            float scrape_flutter = nb[0] * ep.flutter_dep * 0.4f;
 
             // AFC Pull-in: Error decays exponentially as TV catches sync.
             // Real VHS PLL pull-in time constant is ~3-8 scanlines.
@@ -1252,7 +1294,7 @@ public:
                                      + std::cos(src_y * 0.35f - wallTime_ * 52.0f) * 0.5f
                                      + std::sin(src_y * 0.11f + wallTime_ * 19.0f) * 0.4f
                                      + std::sin(src_y * 0.47f - wallTime_ * 71.0f) * 0.25f
-                                     + std::normal_distribution<float>(0, 1)(rng) * 0.6f;
+                                     + nb[1] * 0.6f;
                  float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
                  h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * (rf_penalty + unlock * 1.4f);
             }
@@ -1281,10 +1323,10 @@ public:
             // Per-line wow offset for single-threaded path
             // Very subtle: max 1-2° phase error at max settings
             float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + wallTime_ * 1.2f);
-            line_wow_offset += std::normal_distribution<float>(0.0f, demag_deg * 0.05f + unlock * 0.08f)(rng);
+            line_wow_offset += nb[2] * (demag_deg * 0.05f + unlock * 0.08f);
             float line_flutter_base = flutter_dev * 0.008f *
                 std::sin(float(y) * 0.3f + wallTime_ * 47.0f) *
-                std::normal_distribution<float>(0.0f, 1.0f)(rng);
+                nb[3];
 
             // --- ENCODE ---
             float field_phase_offset = inter_field_phase_deg * 0.15f * float(currentField);
@@ -1311,17 +1353,19 @@ public:
             for (int x = 0; x < W_TOTAL; ++x) {
                 float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
                 float xSrc = (float)x - current_tbe;
+                bool inLine = xSrc >= 0.0f && xSrc < float(W_TOTAL);
+                bool activeSrc = inLine && xSrc >= H_BLANK && xSrc < float(H_BLANK + W);
 
                 float theta = linePhase + xSrc * kSC_PX + line_wow_offset + field_phase_offset;
 
                 float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
-                if (xSrc < 60) {
+                if (inLine && xSrc < 60) {
                     Y = -0.3f; // Sync
-                } else if (xSrc >= 70 && xSrc < 110) {
+                } else if (inLine && xSrc >= 70 && xSrc < 110) {
                     Y = 0.0f;  // Burst
                     I = 0.0f; Q = 0.35f;
-                } else if (xSrc >= H_BLANK) {
+                } else if (activeSrc) {
                     if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.05f) {
                         d_tail = 1.0f;
                     }
@@ -1377,7 +1421,7 @@ public:
                         d_tail *= 0.92f;
                     }
                 }
-                if (tracking_rf < 0.95f && xSrc >= H_BLANK) {
+                if (tracking_rf < 0.95f && activeSrc) {
                      float noise_thresh = tracking_rf * tracking_rf;
                      if (std::uniform_real_distribution<float>(0, 1)(rng) > noise_thresh) {
                           Y = std::uniform_real_distribution<float>(-0.2f, 1.0f)(rng);
@@ -1385,7 +1429,7 @@ public:
                      }
                  }
 
-                if (dropout_active) {
+                if (dropout_active && activeSrc) {
                     float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
                     if (dist_to_dropout < dropout_duration * 0.5f) {
                         float edge_dist = std::min(
@@ -1403,7 +1447,7 @@ public:
                     }
                 }
 
-                if (head_pre_echo_deg > 0.005f && xSrc >= H_BLANK && !first_line) {
+                if (head_pre_echo_deg > 0.005f && activeSrc && !first_line) {
                     float echo_delay = 3.0f + helical_sweep_deg * 4.0f;
                     int echo_x = std::clamp(x - int(echo_delay), 0, W_TOTAL - 1);
                     float echo_sig = prev_comp_line[echo_x];
@@ -1459,7 +1503,7 @@ public:
                 int x = out_x + H_BLANK;
                 float sig = curr_comp_line[x];
 
-                pll_drift_accum += std::normal_distribution<float>(0, 1)(rng) * pll_instability;
+                pll_drift_accum += nb[H_BLANK + out_x] * pll_instability;
 
                 float x_norm = float(out_x) / float(W);
                 float within_line_flutter = line_flutter_base *
@@ -1483,7 +1527,7 @@ public:
                 float g = lpY - 0.272f * si - 0.647f * sq;
                 float b = lpY - 1.106f * si + 1.703f * sq;
 
-                float snow = std::normal_distribution<float>(0.0f, wear_noise * 0.12f)(rng);
+                float snow = noise_buf_[(H_ - 1 - y) * W_TOTAL_ + (W_TOTAL_ - 1 - out_x)] * (wear_noise * 0.12f);
                 r += snow;
                 g += snow;
                 b += snow;
@@ -1515,11 +1559,15 @@ public:
             first_line = false;
         }
 #endif
+        cv::Mat crtOut;
+        applyCRTOutput(out, crtOut, tv, frameNum);
+        out = std::move(crtOut);
     }
 
 private:
     int W_ = 0, H_BLANK = 0, W_TOTAL = 0;
     float kSC_PX = 0.f;
+    cv::Mat phosphor_buffer_;
 };
 
 // ============================================================
@@ -1657,7 +1705,7 @@ static void apply(const cv::Mat& s,cv::Mat& d,const Params& p){
 //  §6  Global audio clock
 // ============================================================
 static std::atomic<int64_t> g_audioSamplePos{0};
-static std::atomic<float>   g_sourceFPS{kNTSC_FPS};  // default to NTSC 29.97
+static std::atomic<float>   g_sourceFPS{kNTSC_FIELD_HZ};  // default to NTSC 59.94 field cadence
 static std::atomic<bool>    g_videoReset{false};
 static std::atomic<bool>    g_pipelineFlush{false};  // clear queues + reset counters
 static std::atomic<bool>    g_videoEnded{false};     // video reached end, switch to demo
@@ -1687,6 +1735,7 @@ struct ProcessParams {
     std::atomic<bool> ntscEnabled{true};
     EngineParams      epSnap;
     VideoParams       vpSnap;
+    TVParams          tvSnap;
     float             tapeSpd{1.f};
     float             instantSpd{1.f};
     std::atomic<bool> engValid{false};
@@ -1710,10 +1759,11 @@ private:
     std::thread        thread_;
     std::atomic<float> fps_{0.f};
     int                frameNum_{0};
+    cv::Mat            fieldDisplay_;
 
     void loop(ProcessParams& pp){
         auto tPrev=std::chrono::steady_clock::now();int fpsCount=0;
-        ntsc_.initBuffers(FW,FH);
+        ntsc_.initBuffers(PROCESS_W,PROCESS_H);
         cv::Mat last_raw;
         auto loop_timer = std::chrono::steady_clock::now();
         auto wallPrev = std::chrono::steady_clock::now();
@@ -1725,24 +1775,25 @@ private:
                 rawQ.clear();
                 outQ.clear();
                 last_raw = cv::Mat{};
+                fieldDisplay_ = cv::Mat{};
                 frameNum_ = 0;
             }
 
-            int64_t apos = g_audioSamplePos.load();
-            float sf = g_sourceFPS.load();
-            
-            // ── PIPELINE RATE LIMITING — run at wall-clock rate (~30fps) ───
+            // ── PIPELINE RATE LIMITING — run at NTSC field rate (~59.94 Hz) ─
             // The audio clock controls VIDEO SEEK (capture thread), NOT
             // the processing rate. The NTSC pipeline always runs at full
             // wall-clock speed so effects (flutter, head-switch, V-roll)
             // maintain their natural timing regardless of tape speed.
             auto now_time = std::chrono::steady_clock::now();
-            long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now_time - loop_timer).count();
-            if (elapsed < 32) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            long long elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(now_time - loop_timer).count();
+            constexpr long long targetFieldUs = (long long)(1000000.0 / kNTSC_FIELD_HZ + 0.5);
+            if (elapsedUs < targetFieldUs) {
+                long long sleepUs = std::min<long long>(targetFieldUs - elapsedUs, 1000);
+                std::this_thread::sleep_for(std::chrono::microseconds(std::max<long long>(100, sleepUs)));
                 continue;
             }
-            loop_timer = now_time;
+            loop_timer += std::chrono::microseconds(targetFieldUs);
+            if (now_time - loop_timer > std::chrono::milliseconds(80)) loop_timer = now_time;
 
             cv::Mat raw; 
             if(!rawQ.try_pop(raw)) {
@@ -1766,15 +1817,21 @@ private:
                 }
                 last_raw = raw;
             }
-            Effects::Params fx; bool ntscOn; EngineParams ep{}; VideoParams vp{}; float spd=1.f; float iSpd=1.f;
+            Effects::Params fx; bool ntscOn; EngineParams ep{}; VideoParams vp{}; TVParams tv{}; float spd=1.f; float iSpd=1.f;
             bool hasEng=false; int si=0;
             {std::lock_guard<std::mutex> lk(pp.mu);
-             fx=pp.fx;ntscOn=pp.ntscEnabled.load();ep=pp.epSnap;vp=pp.vpSnap;spd=pp.tapeSpd;iSpd=pp.instantSpd;
+             fx=pp.fx;ntscOn=pp.ntscEnabled.load();ep=pp.epSnap;vp=pp.vpSnap;tv=pp.tvSnap;spd=pp.tapeSpd;iSpd=pp.instantSpd;
              hasEng=pp.engValid;si=pp.spdIdx.load();}
             if(!hasEng){switch(si){case 1:ep.ips_base=7.5f;break;case 2:ep.ips_base=3.75f;break;default:ep.ips_base=15.f;}}
-            static float ph=0.f; ph+=.01f; if(ph>1.f)ph-=1.f; fx.phase=ph;
+            static float ph=0.f; ph += 0.30f / kNTSC_FIELD_HZ; if(ph>1.f)ph-=1.f; fx.phase=ph;
+            cv::Mat workRaw;
+            if(raw.cols != PROCESS_W || raw.rows != PROCESS_H) {
+                cv::resize(raw, workRaw, {PROCESS_W, PROCESS_H}, 0, 0, cv::INTER_AREA);
+            } else {
+                workRaw = raw;
+            }
             cv::Mat eff,proc;
-            Effects::apply(raw,eff,fx);
+            Effects::apply(workRaw,eff,fx);
 
             // Real wall-clock delta for NTSC oscillators
             auto wallNow = std::chrono::steady_clock::now();
@@ -1783,12 +1840,12 @@ private:
             // Only clamp tiny values (first frame jitter). Don't clamp large values
             // — when pipeline is rate-limited by audio clock, wallDt MUST be large
             // so NTSC oscillators scale proportionally.
-            if (wallDt < 0.001f) wallDt = kNTSC_FRAME_S;
+            if (wallDt < 0.001f) wallDt = kNTSC_FIELD_S;
 
             if(ntscOn){
                 if(!hasEng){EngineParams def{};def.ips_base=15.f;def.hiss=.003f;def.wow_dep=.3f;def.flutter_dep=.08f;
-                    ntsc_.tapeTime_ = (float)frameNum_ / kNTSC_FPS;
-                    ntsc_.process(eff,proc,frameNum_,def,vp,1.f,1.f,wallDt);}
+                    ntsc_.tapeTime_ = (float)frameNum_ / kNTSC_FIELD_HZ;
+                    ntsc_.process(eff,proc,frameNum_,def,vp,tv,1.f,1.f,wallDt);}
                 else {
                     float syncOffset = pp.av_sync_offset_ms;
                     int64_t latencyComp = int64_t(syncOffset * AUDIO_SR / 1000.0f);
@@ -1796,13 +1853,33 @@ private:
 
                     float histSpd = spd;
                     ntsc_.tapeTime_ = (float)adjApos / AUDIO_SR;
-                    ntsc_.process(eff,proc,frameNum_,ep,vp,spd,histSpd,wallDt);
+                    ntsc_.process(eff,proc,frameNum_,ep,vp,tv,spd,histSpd,wallDt);
                 }}
 
 
 
             else proc=eff;
-            
+
+            if(proc.cols != FW || proc.rows != FH) {
+                cv::Mat up;
+                cv::resize(proc, up, {FW, FH}, 0, 0, cv::INTER_LINEAR);
+                proc = std::move(up);
+            }
+
+            if(ntscOn) {
+                if(fieldDisplay_.empty() || fieldDisplay_.size()!=proc.size() || fieldDisplay_.type()!=proc.type()) {
+                    proc.copyTo(fieldDisplay_);
+                } else {
+                    int fieldParity = frameNum_ & 1;
+                    for(int y=fieldParity; y<proc.rows; y+=2) {
+                        proc.row(y).copyTo(fieldDisplay_.row(y));
+                    }
+                    proc = fieldDisplay_.clone();
+                }
+            } else {
+                fieldDisplay_ = cv::Mat{};
+            }
+
             // Recording hook removed - now handled asynchronously in recordThread
 
 
@@ -1838,7 +1915,7 @@ private:
         cv::VideoCapture cap; SourceType lastSrc=SourceType::Demo; std::string lastFile;
         auto tPrev=std::chrono::steady_clock::now(); int fpsCount=0;
         // Source FPS: demo runs at NTSC, camera/file use detected rate
-        double srcFPS = kNTSC_FPS;
+        double srcFPS = kNTSC_FIELD_HZ;
         auto wallClock = std::chrono::steady_clock::now();
 
         while(running_){
@@ -1875,6 +1952,9 @@ private:
                          srcFPS=cap.get(cv::CAP_PROP_FPS); if(srcFPS<=0)srcFPS=kNTSC_FPS;
                          g_sourceFPS.store(float(srcFPS)); g_videoReset.store(true);
                     }
+                } else {
+                    srcFPS = kNTSC_FIELD_HZ;
+                    g_sourceFPS.store(float(srcFPS));
                 }
                 lastSrc=src;lastFile=fp;wallClock=std::chrono::steady_clock::now();}
 
@@ -1884,7 +1964,7 @@ private:
 
             cv::Mat frame;
             if(src==SourceType::Demo){
-                // NTSC-locked wall-clock pacing: generate at 29.97 fps
+                // NTSC-locked wall-clock pacing: generate at 59.94 field cadence
                 auto now=std::chrono::steady_clock::now();
                 float el=std::chrono::duration<float,std::milli>(now-wallClock).count();
                 float iv=1000.f/float(srcFPS);
@@ -1970,6 +2050,7 @@ struct AppState {
     float vuL=0.f,vuR=0.f;
     uint64_t startMs=SDL_GetTicks64();
     VideoParams videoParams;
+    TVParams tvParams;
     EngineParams baseParams;
     float av_sync_offset_ms{0.f};
 
@@ -2282,7 +2363,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
          int64_t vf=sf>0?int64_t(double(ap)/(AUDIO_SR/sf)):0;
          ImGui::Text("APOS  %8lld smp",(long long)ap);
          ImGui::Text("VFRM  %8lld",(long long)vf);
-         ImGui::Text("SFPS  %6.2f  (NTSC %.2f)",(double)sf,kNTSC_FPS);
+         ImGui::Text("SFPS  %6.2f  FIELD %.2f",(double)sf,kNTSC_FIELD_HZ);
          
          bool locked = false;
          { std::lock_guard<std::mutex> a_lk(app.audioMu);
@@ -2412,6 +2493,38 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         ImGui::SetNextItemWidth(colW-130);tCh|=ImGui::SliderFloat(n,v,lo,hi);};
     EngineParams& bp=app.baseParams;
 
+    sectionHdr("CRT TV");
+    int tvPresetIdx = (int)app.tvParams.preset;
+    ImGui::SetNextItemWidth(colW-18);
+    if(ImGui::Combo("TV PRESET",&tvPresetIdx,kTVPresetNames,(int)TVPreset::COUNT)){
+        applyTVPreset(app.tvParams,(TVPreset)tvPresetIdx);
+    }
+    int outputIdx = (int)app.tvParams.output_type;
+    ImGui::SetNextItemWidth(colW-18);
+    if(ImGui::Combo("VCR OUTPUT",&outputIdx,kTVOutputNames,3)){
+        app.tvParams.output_type=(VCROutputType)outputIdx;
+    }
+    int combIdx = (int)app.tvParams.comb_quality;
+    ImGui::SetNextItemWidth(colW-18);
+    if(ImGui::Combo("COMB",&combIdx,kCombFilterNames,3)){
+        app.tvParams.comb_quality=(CombFilterType)combIdx;
+    }
+    int maskIdx = (int)app.tvParams.mask_type;
+    ImGui::SetNextItemWidth(colW-18);
+    if(ImGui::Combo("MASK",&maskIdx,kMaskTypeNames,4)){
+        app.tvParams.mask_type=(MaskType)maskIdx;
+    }
+    sl3("BRIGHTNESS",&app.tvParams.tv_brightness,0,1);
+    sl3("CONTRAST",&app.tvParams.tv_contrast,.5f,1.5f);
+    sl3("COLOR",&app.tvParams.tv_color,0,1.8f);
+    sl3("HUE",&app.tvParams.tv_hue,-25,25);
+    sl3("SHARPNESS",&app.tvParams.tv_sharpness,0,1);
+    sl3("SCANLINES",&app.tvParams.scanline_strength,0,.8f);
+    sl3("BLOOM",&app.tvParams.tv_bloom,0,1);
+    sl3("CONVERGENCE",&app.tvParams.convergence_error,0,1);
+    sl3("PINCUSHION",&app.tvParams.tv_pincushion,0,.5f);
+    sl3("INPUT NOISE",&app.tvParams.input_noise,0,.08f);
+
     if(!hasTapeEngine){ImGui::Spacing();ImGui::TextColored({.9f,.3f,.3f,1.f},"Load video file to enable tape DSP");}
 
     sectionHdr("TRANSPORT");
@@ -2459,6 +2572,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
         std::lock_guard<std::mutex> lk2(app.pp.mu);
         app.pp.epSnap=bp;
         app.pp.vpSnap=app.videoParams;
+        app.pp.tvSnap=app.tvParams;
         app.pp.tapeSpd=bp.tape_speed_mult;
         app.pp.engValid.store(hasTapeEngine);
     }
@@ -2490,7 +2604,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     for(auto&pr:prs){
         if(ImGui::Button(pr.n,{colW-18,0})){
             app.setParamVideo(pr.fn);
-            std::lock_guard<std::mutex> lk2(app.pp.mu);app.pp.epSnap=app.baseParams;app.pp.vpSnap=app.videoParams;app.pp.tapeSpd=app.baseParams.tape_speed_mult;app.pp.engValid.store(true);}}
+            std::lock_guard<std::mutex> lk2(app.pp.mu);app.pp.epSnap=app.baseParams;app.pp.vpSnap=app.videoParams;app.pp.tvSnap=app.tvParams;app.pp.tapeSpd=app.baseParams.tape_speed_mult;app.pp.engValid.store(true);}}
     
     sectionHdr("AUDIO METERS");
     ImGui::Text("L:"); ImGui::SameLine(); vuBar(app.vuL,colW-46,10,app.vuL>.95f);
@@ -2513,7 +2627,7 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
             
             {
                 std::lock_guard<std::mutex> wlk(app.exportCtx.writerMu);
-                if (app.exportCtx.writer.open(app.exportCtx.tempVideoPath, fourcc, kNTSC_FPS, {FW, FH})) {
+                if (app.exportCtx.writer.open(app.exportCtx.tempVideoPath, fourcc, kNTSC_FIELD_HZ, {FW, FH})) {
                     app.exportCtx.active = true;
                 }
             }
@@ -2597,10 +2711,10 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
      int64_t vf=sf>0?int64_t(double(ap)/(AUDIO_SR/sf)):0;
      ImGui::Text("AUDIO POS: %8lld smp",(long long)ap);
      ImGui::Text("VIDEO FRM: %8lld",(long long)vf);
-     ImGui::Text("SRC FPS:   %6.2f  (NTSC %.2f)",(double)sf,kNTSC_FPS);
+     ImGui::Text("SRC FPS:   %6.2f  FIELD %.2f",(double)sf,kNTSC_FIELD_HZ);
      ImGui::Text("PROC FPS:  %6.1f",(double)app.pipeline.fps());
      ImGui::Text("H-SYNC:    %.2f Hz",kNTSC_HSYNC);
-     ImGui::Text("V-SYNC:    %.2f Hz",kNTSC_FPS*2.f);
+     ImGui::Text("V-SYNC:    %.2f Hz",kNTSC_FIELD_HZ);
      bool locked = false;
      { std::lock_guard<std::mutex> a_lk(app.audioMu);
        locked=app.tapeEngine&&app.audioIO&&app.audioIO->is_open(); }
@@ -2621,7 +2735,8 @@ int main(int,char**){
         SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
         1520,900,SDL_WINDOW_RESIZABLE|SDL_WINDOW_ALLOW_HIGHDPI);
     if(!win){SDL_Log("Window: %s",SDL_GetError());return 1;}
-    SDL_Renderer*ren=SDL_CreateRenderer(win,-1,SDL_RENDERER_ACCELERATED);
+    SDL_Renderer*ren=SDL_CreateRenderer(win,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+    if(!ren) ren=SDL_CreateRenderer(win,-1,SDL_RENDERER_ACCELERATED);
     if(!ren){SDL_Log("Renderer: %s",SDL_GetError());return 1;}
 
     IMGUI_CHECKVERSION(); ImGui::CreateContext();
@@ -2633,6 +2748,8 @@ int main(int,char**){
     ImGui_ImplSDLRenderer2_Init(ren);
 
     AppState app;
+    applyTVPreset(app.tvParams, TVPreset::LivingRoom19);
+    app.pp.tvSnap = app.tvParams;
     app.outTex.create(ren,FW,FH);
     app.rawTex.create(ren,FW/2,FH/2);
 
@@ -2665,6 +2782,7 @@ int main(int,char**){
             std::lock_guard<std::mutex> lk2(app.pp.mu);
             app.pp.epSnap=app.baseParams;
             app.pp.vpSnap=app.videoParams;
+            app.pp.tvSnap=app.tvParams;
             app.pp.tapeSpd=app.baseParams.tape_speed_mult;
             app.pp.engValid.store(true);
             
@@ -2710,7 +2828,7 @@ int main(int,char**){
                     
                     // 2. Write Audio (Synced)
                     if (app.exportCtx.audioFp) {
-                        double totalExpected = (double)app.exportCtx.frameCount * (SR / kNTSC_FPS);
+                        double totalExpected = (double)app.exportCtx.frameCount * (SR / kNTSC_FIELD_HZ);
                         int toWriteTotal = (int)totalExpected - (int)app.exportCtx.audioFramesWritten;
                         
                         if (toWriteTotal > 0) {
@@ -2925,9 +3043,10 @@ int main(int,char**){
              int64_t total=app.tapeEngine->total_samples;
              if(total>0&&g_audioSamplePos.load()>total) g_audioSamplePos.store(0);
              {std::lock_guard<std::mutex> lk(app.pp.mu);
-              app.pp.epSnap=active;
-              app.pp.vpSnap=app.videoParams;
-              app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
+             app.pp.epSnap=active;
+             app.pp.vpSnap=app.videoParams;
+             app.pp.tvSnap=app.tvParams;
+             app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
               app.pp.tapeSpd=spd; app.pp.instantSpd=app.tapeEngine->transport.last_instant_speed; app.pp.engValid.store(true);
               app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
              }}}
@@ -2960,7 +3079,7 @@ int main(int,char**){
             app.pipeline.rawQ.clear();
             app.pipeline.outQ.clear();
             g_audioSamplePos.store(0);
-            g_sourceFPS.store(kNTSC_FPS);
+            g_sourceFPS.store(kNTSC_FIELD_HZ);
         }
 
         // Copy lastOut to lastRaw for source monitor
