@@ -27,7 +27,7 @@ if(ADO_OPENMP)
 endif()
 
 # ── CapstanVar library ─────────────────────────────────────
-set(CAPSTANVAR_ROOT "/mnt/MassArchive/Programs/Tape Warping/CapstanVar")
+set(CAPSTANVAR_ROOT "/mnt/MassArchive/Programs/Tape Warping/video-sim-cpp/CapstanVar")
 set(CAPSTANVAR_INCLUDE "${CAPSTANVAR_ROOT}/include")
 
 # ── Fetch Dear ImGui ────────────────────────────────────────

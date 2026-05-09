@@ -2836,7 +2836,7 @@ int main(int,char**){
                             int fromRes = std::min((int)residue.size()/2, toWriteTotal);
                             for(int i=0; i<fromRes*2; ++i) {
                                 float s = residue[i];
-                                if(s>1.f) s=1.f; if(s<-1.f) s=-1.f;
+                                { if(s>1.f) s=1.f; if(s<-1.f) s=-1.f; }
                                 pcm.push_back((int16_t)(s * 32767.f));
                             }
                             residue.erase(residue.begin(), residue.begin() + fromRes*2);
@@ -2846,7 +2846,7 @@ int main(int,char**){
                                 int fromBlock = std::min((int)block.size()/2, remaining);
                                 for(int i=0; i<fromBlock*2; ++i) {
                                     float s = block[i];
-                                    if(s>1.f) s=1.f; if(s<-1.f) s=-1.f;
+                                    { if(s>1.f) s=1.f; if(s<-1.f) s=-1.f; }
                                     pcm.push_back((int16_t)(s * 32767.f));
                                 }
                                 if(fromBlock * 2 < (int)block.size()) {
