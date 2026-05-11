@@ -207,37 +207,37 @@ int main(int, char**) {
                 float dropout_deg = std::clamp(app.baseParams.dropout_rate * 10.0f, 0.0f, 1.0f);
                 float motor_deg = std::clamp(app.baseParams.motor_health, 0.0f, 1.0f);
                 float crease_deg = std::clamp(app.videoParams.tape_crease, 0.0f, 1.0f);
-                float oxide_deg = std::clamp(app.baseParams.oxide_shedding, 0.0f, 1.0f);
-                float demag_deg = std::clamp(app.baseParams.demagnetization, 0.0f, 1.0f);
-                float sticky_deg = std::clamp(app.baseParams.sticky_shed, 0.0f, 1.0f);
+                float metal_deg = std::clamp(app.baseParams.tape_metal_loss, 0.0f, 1.0f);
+                float binder_deg = std::clamp(app.baseParams.tape_binder_decay, 0.0f, 1.0f);
+                float head_wear_deg = std::clamp(app.baseParams.tape_head_wear, 0.0f, 1.0f);
 
                 float rf_level = 1.0f - tracking_deg * 0.7f
                                         - dropout_deg * 0.3f
-                                        - oxide_deg * 0.4f
+                                        - metal_deg * 0.55f
                                         - crease_deg * 0.5f;
 
                 float chroma_atten = 1.0f - tracking_deg * 0.6f
                                          - motor_deg * 0.3f
-                                         - demag_deg * 0.4f;
+                                         - head_wear_deg * 0.55f;
 
                 float luma_noise = tracking_deg * 0.5f
                                  + dropout_deg * 0.3f
-                                 + oxide_deg * 0.4f
-                                 + sticky_deg * 0.2f;
+                                 + metal_deg * 0.45f
+                                 + binder_deg * 0.25f;
 
                 float chroma_noise = tracking_deg * 0.6f
-                                  + motor_deg * 0.4f
-                                  + demag_deg * 0.5f;
+                                   + motor_deg * 0.4f
+                                   + head_wear_deg * 0.50f;
 
                 float dropout_intensity = dropout_deg * 0.8f
-                                       + oxide_deg * 0.6f
+                                       + metal_deg * 0.6f
                                        + tracking_deg * 0.4f;
 
                 float signal_loss = tracking_deg * 0.6f
                                 + dropout_deg * 0.3f
-                                + oxide_deg * 0.4f
+                                + metal_deg * 0.45f
                                 + crease_deg * 0.5f
-                                + sticky_deg * 0.3f;
+                                + binder_deg * 0.3f;
 
                 static float signal_lpf = 1.0f;
                 signal_lpf += (1.0f - signal_loss - signal_lpf) * 0.1f;
@@ -287,14 +287,14 @@ int main(int, char**) {
                     active.dropout_rate += motor_deg * 0.03f;
                 }
 
-                if (sticky_deg > 0.01f) {
-                    active.cutoff_base *= std::max(0.1f, 1.0f - sticky_deg * 0.7f);
-                    active.hiss += sticky_deg * 0.008f;
+                if (binder_deg > 0.01f) {
+                    active.cutoff_base *= std::max(0.1f, 1.0f - binder_deg * 0.7f);
+                    active.hiss += binder_deg * 0.008f;
                 }
 
-                if (demag_deg > 0.01f) {
-                    active.print_through += demag_deg * 0.3f;
-                    active.hiss += demag_deg * 0.005f;
+                if (head_wear_deg > 0.01f) {
+                    active.print_through += head_wear_deg * 0.3f;
+                    active.hiss += head_wear_deg * 0.005f;
                 }
 
                 float spd = 1.f;
@@ -333,10 +333,9 @@ int main(int, char**) {
                     app.pp.vpSnap.dropout_intensity = dropout_intensity;
                     app.pp.vpSnap.dropout_rate = app.baseParams.dropout_rate;
                     app.pp.vpSnap.motor_health = app.baseParams.motor_health;
-                    app.pp.vpSnap.oxide_shedding = app.baseParams.oxide_shedding;
-                    app.pp.vpSnap.demagnetization = app.baseParams.demagnetization;
-                    app.pp.vpSnap.sticky_shed = app.baseParams.sticky_shed;
-                    app.pp.vpSnap.tape_age = 0.0f;
+                    app.pp.vpSnap.tape_metal_loss = app.baseParams.tape_metal_loss;
+                    app.pp.vpSnap.tape_binder_decay = app.baseParams.tape_binder_decay;
+                    app.pp.vpSnap.tape_head_wear = app.baseParams.tape_head_wear;
                     app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
                     app.pp.ntscEnabled = app.ntscEnabled;
                     app.pp.tapeSpd = spd;

@@ -126,10 +126,9 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
         float dropout_deg = std::clamp(vp.dropout_rate * 10.0f, 0.0f, 1.0f);
         float motor_deg = std::clamp(vp.motor_health, 0.0f, 1.0f);
         float crease_deg = std::clamp(vp.tape_crease, 0.0f, 1.0f);
-        float oxide_deg = std::clamp(vp.oxide_shedding, 0.0f, 1.0f);
-        float demag_deg = std::clamp(vp.demagnetization, 0.0f, 1.0f);
-        float sticky_deg = std::clamp(vp.sticky_shed, 0.0f, 1.0f);
-        float age_deg = std::clamp(vp.tape_age, 0.0f, 1.0f);
+        float metal_deg = std::clamp(vp.tape_metal_loss, 0.0f, 1.0f);
+        float binder_deg = std::clamp(vp.tape_binder_decay, 0.0f, 1.0f);
+        float head_wear_deg = std::clamp(vp.tape_head_wear, 0.0f, 1.0f);
 
         float helical_sweep_deg = std::clamp(vp.helical_sweep, 0.0f, 1.0f);
         float head_switch_jitter_deg = std::clamp(vp.head_switch_jitter, 0.0f, 1.0f);
@@ -145,38 +144,39 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
 
         float rf_level = 1.0f - tracking_deg * 0.7f
                                - dropout_deg * 0.3f
-                               - oxide_deg * 0.4f
+                               - metal_deg * 0.55f
                                - crease_deg * 0.5f
-                               - age_deg * 0.3f;
+                               - binder_deg * 0.25f;
         rf_level = std::clamp(rf_level, 0.05f, 1.0f);
 
         float chroma_attenuation = 1.0f - tracking_deg * 0.6f
                                          - motor_deg * 0.3f
-                                         - demag_deg * 0.55f
-                                         - oxide_deg * 0.25f
-                                         - age_deg * 0.2f;
+                                         - head_wear_deg * 0.55f
+                                         - metal_deg * 0.20f
+                                         - binder_deg * 0.18f;
         chroma_attenuation = std::clamp(chroma_attenuation, 0.03f, 1.0f);
 
         float luma_noise_level = tracking_deg * 0.5f
                                + dropout_deg * 0.3f
-                               + oxide_deg * 0.4f
-                               + age_deg * 0.3f
-                               + sticky_deg * 0.2f;
+                               + metal_deg * 0.45f
+                               + binder_deg * 0.25f
+                               + head_wear_deg * 0.15f;
         // Brand modifier: Panasonic has quieter head amp (-52 dB), Sharp is noisier (-46 dB)
         float head_amp_noise_scale = std::pow(10.0f, (-brand_profile_.head_amp_noise_floor_db - 48.0f) / 20.0f);
         luma_noise_level *= head_amp_noise_scale;
 
         float chroma_noise_level = tracking_deg * 0.6f
                                  + motor_deg * 0.4f
-                                 + demag_deg * 0.5f
-                                 + oxide_deg * 0.3f;
+                                 + head_wear_deg * 0.50f
+                                 + metal_deg * 0.25f
+                                 + binder_deg * 0.15f;
         float wear_noise = std::clamp(
             (1.0f - rf_level) * 0.9f + luma_noise_level * 0.25f + chroma_noise_level * 0.2f,
             0.0f,
             1.2f);
 
         float dropout_drive = std::clamp(
-            vp.dropout_rate + vp.oxide_shedding * 0.16f + vp.sticky_shed * 0.10f + vp.tape_age * 0.08f + vp.tape_crease * 0.03f,
+            vp.dropout_rate + vp.tape_metal_loss * 0.18f + vp.tape_binder_decay * 0.12f + vp.tape_crease * 0.03f,
             0.0f,
             0.25f);
 
@@ -209,10 +209,9 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
         // can lock onto. Worn tape weakens pulse amplitude and causes unstable lock.
         float tracking_pulse_strength = std::clamp(
             rf_level
-            - oxide_deg * 0.45f
-            - demag_deg * 0.35f
-            - sticky_deg * 0.22f
-            - age_deg * 0.30f
+            - metal_deg * 0.45f
+            - head_wear_deg * 0.35f
+            - binder_deg * 0.22f
             - motor_deg * 0.10f
             - ep.motor_drag * 0.16f
             - dropout_drive * 1.8f
@@ -569,7 +568,7 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 float head_switch_shift = tracking_shift;  // Stable offset
 
                 line_afc += head_squewing + drum_height_ske;
-                float flyback_unlock_jitter = unlock * (6.0f + age_deg * 14.0f + sticky_deg * 18.0f)
+                float flyback_unlock_jitter = unlock * (6.0f + binder_deg * 16.0f + head_wear_deg * 14.0f)
                     * std::sin(float(y) * 0.42f + wallTime_ * 91.0f);
                 float unlock_top_gate = 1.0f - std::exp(-float(y) * 0.06f);
                 line_afc += flyback_unlock_jitter * unlock_top_gate;
@@ -832,7 +831,7 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 //
                 // Values are in radians. Max settings produce ~1-2° phase error.
                 float line_wow_offset = wow_dev * 0.02f * std::sin(float(y) * 0.08f + tapeTime_ * 1.2f);
-                line_wow_offset += nb[2] * (demag_deg * 0.05f + unlock * 0.08f);
+                line_wow_offset += nb[2] * (head_wear_deg * 0.05f + unlock * 0.08f);
 
                 // --- ENCODE ---
                 float field_phase_offset = inter_field_phase_deg * 0.15f * float(currentField);
@@ -1080,7 +1079,7 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                     b += spark;
                 }
 
-                float smear = std::clamp((sticky_deg * 0.6f + age_deg * 0.4f) / bw_sharpness_factor, 0.0f, 0.85f);
+                float smear = std::clamp((metal_deg * 0.6f + binder_deg * 0.4f) / bw_sharpness_factor, 0.0f, 0.85f);
                 if (has_prev && smear > 0.001f) {
                     r = r * (1.0f - smear) + prev_r * smear;
                     g = g * (1.0f - smear) + prev_g * smear;
