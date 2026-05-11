@@ -4,6 +4,8 @@
 #include "capture_thread.h"
 #include "sdl_utils.h"
 #include "video_effects.h"
+#include "engine.hpp"
+#include "audio_io.hpp"
 #include <functional>
 #include <string>
 #include <atomic>

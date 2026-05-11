@@ -1,4 +1,5 @@
 #include "processing_pipeline.h"
+#include "engine.hpp"
 #include <chrono>
 
 std::atomic<int64_t> g_audioSamplePos{0};
@@ -45,7 +46,7 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
         auto now_time = std::chrono::steady_clock::now();
         long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now_time - loop_timer).count();
         float target_frame_ms = 1000.f / std::max(15.f, g_sourceFPS.load());
-        if (elapsed < long long(target_frame_ms - 1.f)) {
+        if (elapsed < static_cast<long long>(target_frame_ms - 1.f)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -72,6 +73,10 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
                 raw = raw(cv::Rect(ox, oy, cw, ch)).clone();
             }
             last_raw = raw;
+        }
+
+        if (pp.onRawFrame && !raw.empty()) {
+            pp.onRawFrame(raw.clone());
         }
 
         Effects::Params fx;
@@ -131,9 +136,8 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
                 def.ips_base = 15.f;
                 def.hiss = .003f;
                 def.wow_dep = .3f;
-                def.flutter_dep = .08f;
                 ntsc_.tapeTime_ = (float)frameNum_ / kNTSC_FPS;
-                ntsc_.process(eff, proc, frameNum_, def, vp, 1.f, 1.f, wallDt, recording_id);
+                ntsc_.process(eff, proc, frameNum_, ep, vp, 1.f, 1.f, wallDt, recording_id);
             } else {
                 float syncOffset = pp.av_sync_offset_ms;
                 int64_t latencyComp = int64_t(syncOffset * AUDIO_SR / 1000.0f);

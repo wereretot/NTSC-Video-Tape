@@ -3,6 +3,11 @@
 #include "processing_pipeline.h"
 #include "sdl_utils.h"
 #include <string>
+#include "imgui.h"
+#include <SDL2/SDL.h>
+
+struct AppState;
+
 
 void styleBroadcast();
 void sectionHdr(const char* lbl);

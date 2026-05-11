@@ -1,4 +1,5 @@
 #include "sdl_utils.h"
+#include <opencv2/imgproc.hpp>
 
 void SDLTexture::create(SDL_Renderer* r, int W, int H) {
     if (tex) SDL_DestroyTexture(tex);

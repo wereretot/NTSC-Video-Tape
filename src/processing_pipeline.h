@@ -2,11 +2,15 @@
 #include "constants.h"
 #include "ntsc_simulator.h"
 #include "video_effects.h"
+#include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
+
+struct TapeEngine;
 
 enum class ExportFormat { H264_MP4, FFV1_MKV, FFV1_AVI };
 
@@ -29,6 +33,7 @@ struct ProcessParams {
     std::mutex        mu;
     Effects::Params   fx;
     std::atomic<bool> ntscEnabled{true};
+    std::function<void(const cv::Mat&)> onRawFrame;
     EngineParams      epSnap;
     VideoParams       vpSnap;
     float             tapeSpd{1.f};

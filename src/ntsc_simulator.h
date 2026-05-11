@@ -1,8 +1,13 @@
 #pragma once
 
 #include "constants.h"
+#include "vcr_brand.h"
+#include "fm_luma.h"
+#include "color_under.h"
+#include "vcr_audio.h"
+#include "tape_degradation.h"
 // Assuming dsp_types.hpp contains structural dependencies like EngineParams
-#include "../../CapstanVar/include/dsp_types.hpp"
+#include "dsp_types.hpp"
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -36,6 +41,12 @@ struct VideoParams {
     float inter_field_phase_error = 0.1f;
     float head_pre_echo = 0.0f;
     float drum_eccentricity = 0.0f;
+
+    // VCR alignment parameters (0 = perfectly aligned, 1 = severely misaligned)
+    float head_azimuth_error = 0.0f;    // Video head azimuth angle misalignment
+    float tracking_alignment = 0.0f;    // Control track head position error
+    float drum_height_error = 0.0f;     // Drum height / tape path alignment
+    float audio_head_alignment = 0.0f;  // Audio head position/azimuth error
 };
 
 // VCR Output Type and TV params
@@ -87,15 +98,35 @@ class NTSCSimulator {
 public:
     float v_roll_accum_ = 0.0f;
     float noise_bar_phase_ = 0.0f;
-    float tapeTime_ = 0.0f;
-    float wallTime_ = 0.0f;
     float h_roll_phase_ = 0.0f;
     float tracking_error_lpf_ = 0.0f;
+    float tracking_lock_ = 1.0f;
+    float motor_top_bend_phase_ = 0.0f;
+    float motor_top_bend_lpf_ = 0.0f;
+    float crinkle_center_lpf_ = 0.0f;
+    float crinkle_strength_lpf_ = 0.0f;
+    float crinkle_phase_ = 0.0f;
     float mechanical_wow_ = 0.0f;
     float mechanical_flutter_ = 0.0f;
     float afc_error_ = 0.0f;
+    
+    // VCR alignment state (tracks misalignment effects)
+    float head_azimuth_shift_ = 0.0f;     // Head azimuth angle offset (degrees)
+    float tracking_phase_error_ = 0.0f;   // Control track phase error (lines)
+    float drum_tilt_error_ = 0.0f;        // Drum tilt causing top/bottom skew diff
+    float audio_head_shift_ = 0.0f;       // Audio head position error
+    
+    // Motor degradation state
+    float motor_speed_var_ = 0.0f;        // Instantaneous speed deviation
+    float motor_belt_slip_phase_ = 0.0f;  // Belt slip position in frame
+    float capstan_wow_phase_ = 0.0f;      // Capstan motor wow cycle
+    float drum_wobble_accum_ = 0.0f;      // Drum bearing wobble accumulation
+    
+    float tapeTime_ = 0.0f;
+    float wallTime_ = 0.0f;
 
     float wow_phase_[3] = {0.0f, 0.0f, 0.0f};
+    float snow_phase_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float flutter_phase_[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     int recording_id_ = 0;
@@ -112,6 +143,13 @@ public:
     
     TVParams tvParams_;
 
+    // VCR configuration
+    VCRBrand         brand_             = VCRBrand::JVC;
+    VCRBrandProfile  brand_profile_;
+    float            brand_transition_time_ = 0.0f;  // Smooth brand transition timer
+    HeadConfig       head_config_       = {};
+    TapeFormat       tape_format_       = TapeFormat::VHS;
+
     void initBuffers(int w, int h);
 
     void process(const cv::Mat& in, cv::Mat& out, int frameNum, const EngineParams& ep,
@@ -120,8 +158,27 @@ public:
 
     void setRecordingId(int id) { recording_id_ = id; }
 
+    // VCR brand / head / tape format configuration
+    void setBrand(VCRBrand brand) {
+        VCRBrand prev = brand_;
+        brand_ = brand;
+        brand_profile_ = ::getBrandProfile(brand);
+        brand_transition_time_ = (prev != brand) ? 0.5f : 0.0f;
+    }
+    void setHeadCount(HeadCount count) {
+        head_config_ = ::getHeadConfig(count);
+    }
+    void setTapeFormat(TapeFormat fmt) { tape_format_ = fmt; }
+
+    VCRBrand    getBrand()      const { return brand_; }
+    HeadCount   getHeadCount()  const { return head_config_.count; }
+    TapeFormat  getTapeFormat() const { return tape_format_; }
+
+    const VCRBrandProfile& getBrandProfile() const { return brand_profile_; }
+    const HeadConfig&      getHeadConfig()  const { return head_config_; }
+
 private:
-    int W_ = 0, H_ = 0, H_BLANK = 0, W_TOTAL = 0;
+    int W_ = 0, H_ = 0, H_BLANK = 0, W_TOTAL = 0, W_TOTAL_ = 0;
     float kSC_PX = 0.f;
 
     std::vector<float> noise_buf_;
@@ -132,8 +189,21 @@ private:
     cv::Mat phosphor_buffer_;
     HeadState heads_[2];
 
-    void processField(const cv::Mat& inField, cv::Mat& outField, int frameNum, const EngineParams& ep,
-                      const VideoParams& vp, float tapeSpd, float instantSpd, float wallDt, int fieldIdx, int active_head);
+    // FM Luma Processing (Phase 2)
+    FMLumaProcessor fm_luma_;
+    std::vector<float> fm_encode_buf_;
+    std::vector<float> fm_decode_buf_;
+
+    // Color-Under Processing (Phase 3)
+    ColorUnderProcessor color_under_;
+    std::vector<float> cu_chroma_i_buf_;
+    std::vector<float> cu_chroma_q_buf_;
+    std::vector<float> cu_chroma_i_down_;
+    std::vector<float> cu_chroma_q_down_;
+
+    // Tape Degradation (Phase 5)
+    TapeDegradationProcessor tape_degradation_;
+    TapeState tape_state_;
 
     float generateSnow(float time, int x, int y, std::mt19937& rng); // Kept if needed by other components, though noise_buf_ is replacement
 };

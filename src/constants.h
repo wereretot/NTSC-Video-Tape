@@ -9,7 +9,6 @@ static constexpr int   FH            = 480;
 static constexpr float ASPECT        = float(FW)/float(FH);
 static constexpr int   Q_DEPTH       = 4;
 static constexpr int   AUDIO_SR      = 44100;
-static constexpr int   SR            = 44100;
 static const     float kPI           = 3.14159265f;
 static constexpr float kSC_PX        = 2.f * 3.14159265f * 227.5f / float(FW);
 static constexpr float kNTSC_FPS     = 29.97f;

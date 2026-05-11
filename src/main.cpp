@@ -2566,6 +2566,10 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     sl3("FIELD PHASE ERR",&app.videoParams.inter_field_phase_error,0,1);
     sl3("HEAD PRE-ECHO",&app.videoParams.head_pre_echo,0,1);
     sl3("DRUM ECCENTRIC",&app.videoParams.drum_eccentricity,0,1);
+    sl3("HEAD AZIMUTH",&app.videoParams.head_azimuth_error,0,1);
+    sl3("TRACKING ALIGN",&app.videoParams.tracking_alignment,0,1);
+    sl3("DRUM HEIGHT",&app.videoParams.drum_height_error,0,1);
+    sl3("AUDIO HEAD",&app.videoParams.audio_head_alignment,0,1);
     ImGui::EndDisabled();
 
     {

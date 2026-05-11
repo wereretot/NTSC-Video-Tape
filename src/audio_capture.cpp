@@ -1,4 +1,5 @@
 #include "audio_capture.h"
+#include "app_state.h"
 #include "processing_pipeline.h"
 #include <cstdio>
 

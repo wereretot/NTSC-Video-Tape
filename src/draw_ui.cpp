@@ -1,4 +1,6 @@
 #include "ui.h"
+#include "app_state.h"
+#include "audio_capture.h"
 
 static void drawWaveformScope(ImDrawList* dl, const cv::Mat& outF, float sx0, float sy0, float sx1, float sy1, float srcW, float srcH) {
     constexpr float kIlo = -50.f, kIhi = 120.f, kIspan = 170.f;
@@ -296,7 +298,7 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
             app.selectedFx = i;
             std::lock_guard<std::mutex> lk(app.pp.mu);
             app.pp.fx.type = (Effects::Type)i;
-            Effects::s_trail = cv::Mat();
+            Effects::resetTrail();
         }
         if (sel) ImGui::PopStyleColor();
         if (i % 2 == 0) ImGui::SameLine();
@@ -325,6 +327,41 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
         std::lock_guard<std::mutex> lk(app.pp.mu);
         app.pp.spdIdx = app.tapeSpeedIdx;
     }
+
+    // ── VCR Configuration ─────────────────────────────────────────
+    static int vcrBrandIdx = 0;
+    static int vcrHeadIdx = 0;
+    static int vcrFormatIdx = 0;
+    static const char* brandNames[] = {
+        "JVC HR-S3600", "Panasonic AG-1980", "Sony SLV-1000",
+        "Mitsubishi HS-HD2000U", "Sharp VC-A588U", "Toshiba M-462"
+    };
+    static const char* headNames[] = {
+        "2-Head (Standard)", "4-Head (HQ/Slow-Mo)", "6-Head (S-VHS/Pro)"
+    };
+    static const char* formatNames[] = {
+        "VHS", "S-VHS"
+    };
+
+    ImGui::Spacing();
+    ImGui::Text("VCR BRAND:");
+    ImGui::SetNextItemWidth(colW - 130);
+    if (ImGui::Combo("##brand", &vcrBrandIdx, brandNames, 6)) {
+        app.pipeline.ntsc_.setBrand(static_cast<VCRBrand>(vcrBrandIdx));
+    }
+
+    ImGui::Text("HEAD CONFIG:");
+    ImGui::SetNextItemWidth(colW - 130);
+    if (ImGui::Combo("##heads", &vcrHeadIdx, headNames, 3)) {
+        app.pipeline.ntsc_.setHeadCount(static_cast<HeadCount>(2 + vcrHeadIdx * 2));
+    }
+
+    ImGui::Text("TAPE FORMAT:");
+    ImGui::SetNextItemWidth(colW - 130);
+    if (ImGui::Combo("##format", &vcrFormatIdx, formatNames, 2)) {
+        app.pipeline.ntsc_.setTapeFormat(vcrFormatIdx == 0 ? TapeFormat::VHS : TapeFormat::SVHS);
+    }
+
     bool hasTapeEngine = false;
     float vL = 0.f, vR = 0.f;
     {
@@ -349,34 +386,26 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
     }
 
     sectionHdr("TRANSPORT");
-    ImGui::BeginDisabled(!hasTapeEngine);
     sl3("WOW", &bp.wow_dep, 0, 5);
     sl3("FLUTTER", &bp.flutter_dep, 0, 1);
     bp.flutter_dep = std::max(bp.flutter_dep, 0.001f);
     sl3("MOTOR DEGRADE", &bp.motor_health, 0, 1);
     sl3("MOTOR DRAG", &bp.motor_drag, 0, .9f);
     sl3("DROPOUT", &bp.dropout_rate, 0, .1f);
-    ImGui::EndDisabled();
-
     sectionHdr("TAPE WEAR");
-    ImGui::BeginDisabled(!hasTapeEngine);
     sl3("TAPE OXIDE", &bp.oxide_shedding, 0, 1);
     sl3("DEMAGNET", &bp.demagnetization, 0, 1);
     sl3("STICKY SHED", &bp.sticky_shed, 0, .2f);
-    ImGui::EndDisabled();
     sl3("TAPE AGE", &app.videoParams.tape_age, 0, 1);
-
+    sl3("TAPE CREASE", &app.videoParams.tape_crease, 0, 1);
+    sl3("TRACKING ERR", &app.videoParams.tracking_error, 0, 1);
     sectionHdr("ELECTRONICS & NOISE");
-    ImGui::BeginDisabled(!hasTapeEngine);
     sl3("TAPE HISS", &bp.hiss, 0, .02f);
     sl3("HISS COLOR", &bp.hiss_color, 0, 1);
     sl3("MAINS HUM", &bp.mains_hum, 0, .05f);
     sl3("HEAD BUMP", &bp.head_bump, 0, 1);
     sl3("HF CUTOFF", &bp.cutoff_base, 1000, 20000);
-    ImGui::EndDisabled();
-
     sectionHdr("HELICAL SCAN / HEAD");
-    ImGui::BeginDisabled(!hasTapeEngine);
     sl3("HEAD SWEEP", &app.videoParams.helical_sweep, 0, 1);
     sl3("HS JITTER", &app.videoParams.head_switch_jitter, 0, 1);
     sl3("FM CARRIER NOISE", &app.videoParams.fm_carrier_noise, 0, 1);
@@ -384,8 +413,11 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
     sl3("FIELD PHASE ERR", &app.videoParams.inter_field_phase_error, 0, 1);
     sl3("HEAD PRE-ECHO", &app.videoParams.head_pre_echo, 0, 1);
     sl3("DRUM ECCENTRIC", &app.videoParams.drum_eccentricity, 0, 1);
-    ImGui::EndDisabled();
-
+    sectionHdr("HEAD ALIGNMENT");
+    sl3("HEAD AZIMUTH", &app.videoParams.head_azimuth_error, 0, 1);
+    sl3("TRACKING ALIGN", &app.videoParams.tracking_alignment, 0, 1);
+    sl3("DRUM HEIGHT", &app.videoParams.drum_height_error, 0, 1);
+    sl3("AUDIO HEAD", &app.videoParams.audio_head_alignment, 0, 1);
     {
         std::lock_guard<std::mutex> lk2(app.pp.mu);
         app.pp.epSnap = bp;

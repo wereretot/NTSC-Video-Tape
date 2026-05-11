@@ -23,4 +23,6 @@ void apply(const cv::Mat& s, cv::Mat& d, const Params& p);
 
 float calcSignalDegradation(const Params& p);
 
+void resetTrail();
+
 } // namespace Effects

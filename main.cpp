@@ -4,7 +4,7 @@
 #include "src/capture_thread.h"
 #include "src/sdl_utils.h"
 #include "src/ui.h"
-#include "src/draw_ui.cpp"
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -104,6 +104,12 @@ int main(int, char**) {
     app.capture.fileMuPtr = &app.fileMu;
     app.capture.filePathPtr = &app.filePath;
     app.pp.exPtr = &app.exportCtx;
+
+    app.pp.onRawFrame = [&app](const cv::Mat& f) {
+        std::lock_guard<std::mutex> lk(app.frameMu);
+        app.lastRaw = f;
+    };
+
     app.capture.start(app.pipeline.rawQ);
     app.pipeline.start(app.pp);
 
@@ -193,10 +199,11 @@ int main(int, char**) {
             lastPoll = now;
 
             std::lock_guard<std::mutex> a_lk(app.audioMu);
-            if (app.tapeEngine && app.audioIO && app.audioIO->is_open()) {
-                EngineParams active = app.baseParams;
+            bool engineRunning = app.tapeEngine && app.audioIO && app.audioIO->is_open();
+            
+            EngineParams active = app.baseParams;
 
-                float tracking_deg = std::clamp(app.videoParams.tracking_error, 0.0f, 1.0f);
+            float tracking_deg = std::clamp(app.videoParams.tracking_error, 0.0f, 1.0f);
                 float dropout_deg = std::clamp(app.baseParams.dropout_rate * 10.0f, 0.0f, 1.0f);
                 float motor_deg = std::clamp(app.baseParams.motor_health, 0.0f, 1.0f);
                 float crease_deg = std::clamp(app.videoParams.tape_crease, 0.0f, 1.0f);
@@ -291,7 +298,9 @@ int main(int, char**) {
                 }
 
                 float spd = 1.f;
-                {
+                float instantSpd = 1.f;
+                
+                if (engineRunning) {
                     std::lock_guard<std::mutex> lk(app.tapeEngine->lock);
                     float inertia_ramp = app.audioIO->current_speed_mult();
                     spd = inertia_ramp;
@@ -304,10 +313,14 @@ int main(int, char**) {
                     app.tapeEngine->params.is_reversed     = m_rev;
 
                     spd = std::clamp(spd, .01f, 4.f);
+                    
+                    g_audioSamplePos.store(int64_t(app.tapeEngine->play_head));
+                    int64_t total = app.tapeEngine->total_samples;
+                    if (total > 0 && g_audioSamplePos.load() > total) g_audioSamplePos.store(0);
+                    
+                    instantSpd = app.tapeEngine->transport.last_instant_speed;
                 }
-                g_audioSamplePos.store(int64_t(app.tapeEngine->play_head));
-                int64_t total = app.tapeEngine->total_samples;
-                if (total > 0 && g_audioSamplePos.load() > total) g_audioSamplePos.store(0);
+                
                 {
                     std::lock_guard<std::mutex> lk(app.pp.mu);
                     app.pp.epSnap = active;
@@ -325,13 +338,13 @@ int main(int, char**) {
                     app.pp.vpSnap.sticky_shed = app.baseParams.sticky_shed;
                     app.pp.vpSnap.tape_age = 0.0f;
                     app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
+                    app.pp.ntscEnabled = app.ntscEnabled;
                     app.pp.tapeSpd = spd;
-                    app.pp.instantSpd = app.tapeEngine->transport.last_instant_speed;
+                    app.pp.instantSpd = instantSpd;
                     app.pp.recording_id = app.currentRecordingId.load();
-                    app.pp.engValid.store(true);
-                    app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
+                    app.pp.engValid.store(engineRunning);
+                    if (engineRunning) app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
                 }
-            }
         }
 
         if (g_videoEnded.exchange(false)) {
@@ -340,7 +353,7 @@ int main(int, char**) {
 
         {
             std::lock_guard<std::mutex> lk(app.frameMu);
-            if (!app.lastOut.empty()) app.lastRaw = app.lastOut;
+            // DONT overwrite lastRaw!
         }
 
         while (SDL_PollEvent(&evt)) {

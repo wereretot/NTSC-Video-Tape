@@ -1,4 +1,7 @@
 #include "video_effects.h"
+#include "constants.h"
+#include <opencv2/imgproc.hpp>
+#include <random>
 
 namespace Effects {
 
@@ -274,6 +277,10 @@ float calcSignalDegradation(const Params& p) {
     float mixEffect = 1.0f - p.mix * 0.3f;
 
     return std::clamp(baseDegradation * mixEffect, 0.0f, 0.85f);
+}
+
+void resetTrail() {
+    s_trail = cv::Mat();
 }
 
 } // namespace Effects

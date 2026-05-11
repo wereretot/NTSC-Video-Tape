@@ -20,14 +20,14 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libswresample
 )
 pkg_check_modules(PORTAUDIO REQUIRED portaudio-2.0)
-find_package(SndFile REQUIRED)
+pkg_check_modules(SNDFILE REQUIRED sndfile)
 
 if(ADO_OPENMP)
     find_package(OpenMP)
 endif()
 
 # ── CapstanVar library ─────────────────────────────────────
-set(CAPSTANVAR_ROOT "/mnt/MassArchive/Programs/Tape Warping/video-sim-cpp/CapstanVar")
+set(CAPSTANVAR_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/CapstanVar")
 set(CAPSTANVAR_INCLUDE "${CAPSTANVAR_ROOT}/include")
 
 # ── Fetch Dear ImGui ────────────────────────────────────────
@@ -58,8 +58,20 @@ set(CAPSTANVAR_SRC
 )
 
 add_executable(ado8500
-    src/main.cpp
+    main.cpp
+    src/audio_capture.cpp
+    src/capture_thread.cpp
     src/crt_tv.cpp
+    src/draw_ui.cpp
+    src/ntsc_simulator.cpp
+    src/fm_luma.cpp
+    src/color_under.cpp
+    src/vcr_audio.cpp
+    src/tape_degradation.cpp
+    src/processing_pipeline.cpp
+    src/sdl_utils.cpp
+    src/ui.cpp
+    src/video_effects.cpp
     ${IMGUI_SRC}
     ${CAPSTANVAR_SRC}
 )
@@ -85,9 +97,10 @@ target_link_libraries(ado8500 PRIVATE
     ${CMAKE_DL_LIBS}
     PkgConfig::FFMPEG
     ${PORTAUDIO_LIBRARIES}
-    SndFile::sndfile
+    ${SNDFILE_LIBRARIES}
     pthread
 )
+target_include_directories(ado8500 PRIVATE ${SNDFILE_INCLUDE_DIRS})
 
 # OpenMP intra-frame row parallelism
 if(ADO_OPENMP AND OpenMP_CXX_FOUND)
