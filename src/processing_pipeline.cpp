@@ -1,5 +1,6 @@
 #include "processing_pipeline.h"
 #include "engine.hpp"
+#include <SDL2/SDL.h>
 #include <chrono>
 
 std::atomic<int64_t> g_audioSamplePos{0};
@@ -31,8 +32,15 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
     auto loop_timer = std::chrono::steady_clock::now();
     auto wallPrev = std::chrono::steady_clock::now();
     int last_recording_id = -1;
+    
+    // Debug logging
+    static int debug_frame_count = 0;
+    static auto debug_start_time = std::chrono::steady_clock::now();
 
     while (running_) {
+        debug_frame_count++;
+        auto frame_start = std::chrono::steady_clock::now();
+        
         if (g_pipelineFlush.exchange(false)) {
             rawQ.clear();
             outQ.clear();
@@ -51,9 +59,22 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
             continue;
         }
         loop_timer = now_time;
-
+        
         cv::Mat raw;
-        if (!rawQ.try_pop(raw)) {
+        if (g_sourceFPS.load() > 30.0f) {
+            size_t qsz = rawQ.size();
+            while (qsz > 2) {
+                cv::Mat discard;
+                if (rawQ.try_pop(discard)) --qsz;
+                else break;
+            }
+            if (qsz > 2) {
+                if (last_raw.empty()) continue;
+                raw = last_raw;
+            }
+        }
+
+        if (raw.empty() && !rawQ.try_pop(raw)) {
             if (last_raw.empty()) continue;
             raw = last_raw;
         } else {
@@ -119,7 +140,9 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
         if (ph > 1.f) ph -= 1.f;
         fx.phase = ph;
         cv::Mat eff, proc;
+        auto effects_start = std::chrono::steady_clock::now();
         Effects::apply(raw, eff, fx);
+        auto effects_end = std::chrono::steady_clock::now();
 
         float effectDegradation = Effects::calcSignalDegradation(fx);
         float combinedSignalStrength = vp.signal_strength * (1.0f - effectDegradation);
@@ -130,6 +153,7 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
         wallPrev = wallNow;
         if (wallDt < 0.001f) wallDt = kNTSC_FRAME_S;
 
+        auto ntsc_start = std::chrono::steady_clock::now();
         if (ntscOn) {
             if (!hasEng) {
                 EngineParams def{};
@@ -157,6 +181,18 @@ void ProcessingPipeline::loop(ProcessParams& pp) {
             }
         } else {
             proc = eff;
+        }
+        auto ntsc_end = std::chrono::steady_clock::now();
+        
+        // Debug logging every 30 frames
+        if (debug_frame_count % 30 == 0) {
+            float effects_ms = std::chrono::duration<float, std::milli>(effects_end - effects_start).count();
+            float ntsc_ms = std::chrono::duration<float, std::milli>(ntsc_end - ntsc_start).count();
+            float total_elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - debug_start_time).count();
+            SDL_Log("[Pipeline] Frame %d - Effects: %.1fms, NTSC: %.1fms, Total time: %.1fs, FPS: %.2f, raw size: %dx%d",
+                debug_frame_count, effects_ms, ntsc_ms, total_elapsed, 
+                float(debug_frame_count) / total_elapsed,
+                raw.cols, raw.rows);
         }
 
         outQ.push(std::move(proc));

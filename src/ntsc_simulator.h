@@ -41,6 +41,10 @@ struct VideoParams {
     float head_pre_echo = 0.0f;
     float drum_eccentricity = 0.0f;
 
+    // Line-by-line horizontal tearing and skewing
+    float horizontal_tearing = 0.0f;   // Per-line horizontal displacement bands
+    float line_skew = 0.0f;            // Per-line angular skew (parallelogram distortion)
+
     // VCR alignment parameters (0 = perfectly aligned, 1 = severely misaligned)
     float head_azimuth_error = 0.0f;    // Video head azimuth angle misalignment
     float tracking_alignment = 0.0f;    // Control track head position error
@@ -120,6 +124,10 @@ public:
     float motor_belt_slip_phase_ = 0.0f;  // Belt slip position in frame
     float capstan_wow_phase_ = 0.0f;      // Capstan motor wow cycle
     float drum_wobble_accum_ = 0.0f;      // Drum bearing wobble accumulation
+    
+    // Horizontal tearing / line skew state
+    float tear_band_phase_ = 0.0f;         // Phase of tearing band oscillators
+    float skew_wave_phase_ = 0.0f;         // Phase of skew wave oscillators
     
     float tapeTime_ = 0.0f;
     float wallTime_ = 0.0f;

@@ -6,6 +6,9 @@
 
 std::atomic<double> g_wallTimeSec{0.0};
 
+// Maximum processing width for stack-allocated buffers (covers up to 640px output + blanking)
+static constexpr int W_MAX = 800;
+
 static inline uint32_t xorshift32(uint32_t& s) {
     s ^= s << 13; s ^= s >> 17; s ^= s << 5;
     return s;
@@ -13,6 +16,10 @@ static inline uint32_t xorshift32(uint32_t& s) {
 
 static inline float xorshift_f(uint32_t& s) {
     return (float)(xorshift32(s) >> 8) * (1.f / 16777216.f) - 1.f;
+}
+
+static inline float xorshift_f01(uint32_t& s) {
+    return (float)(xorshift32(s) >> 8) * (1.f / 16777216.f) * 0.5f + 0.5f;
 }
 
 static inline float xgauss_(uint32_t& s) {
@@ -142,6 +149,11 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
         float head_pre_echo_deg [[maybe_unused]] = std::clamp(vp.head_pre_echo, 0.0f, 1.0f);
         float drum_ecc_deg = std::clamp(vp.drum_eccentricity, 0.0f, 1.0f);
 
+        // ── Tape speed affects video bandwidth ───────────────────────
+        // SP = 15 ips, LP = 7.5 ips, EP = 3.75 ips. Bandwidth scales
+        // linearly with tape speed.
+        float tape_spd_bw_factor = std::clamp(ep.ips_base / 15.0f, 0.25f, 1.0f);
+
         float rf_level = 1.0f - tracking_deg * 0.7f
                                - dropout_deg * 0.3f
                                - metal_deg * 0.55f
@@ -165,20 +177,45 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
         float head_amp_noise_scale = std::pow(10.0f, (-brand_profile_.head_amp_noise_floor_db - 48.0f) / 20.0f);
         luma_noise_level *= head_amp_noise_scale;
 
+        // ── Head count affects recording quality ──────────────────────
+        // More heads = better recording quality:
+        // 2-head: standard VHS, baseline noise
+        // 4-head: dedicated HQ/digital noise reduction heads, -2 dB noise
+        // 6-head: Hi-Fi heads + eraser head + NR, -4 dB noise
+        float head_count_noise_scale = 1.0f;
+        switch (head_config_.count) {
+            case HeadCount::FourHead: head_count_noise_scale = 0.79f; break; // -2 dB
+            case HeadCount::SixHead:  head_count_noise_scale = 0.63f; break; // -4 dB
+            default: break;
+        }
+        luma_noise_level *= head_count_noise_scale;
+
         float chroma_noise_level = tracking_deg * 0.6f
                                  + motor_deg * 0.4f
                                  + head_wear_deg * 0.50f
                                  + metal_deg * 0.25f
                                  + binder_deg * 0.15f;
+        chroma_noise_level *= head_count_noise_scale;
+
+        // More heads = narrower head gap = better HF response = less wear noise
+        float head_gap_bw_factor = 0.3f / head_config_.head_gap_width_um; // normalize to 2-head (0.3um)
+        head_gap_bw_factor = std::clamp(head_gap_bw_factor, 0.8f, 1.3f);
+
         float wear_noise = std::clamp(
             (1.0f - rf_level) * 0.9f + luma_noise_level * 0.25f + chroma_noise_level * 0.2f,
             0.0f,
             1.2f);
+        // Slower tape speed = more visible noise (less bandwidth to hide it)
+        wear_noise *= (2.0f - tape_spd_bw_factor);
+        // Narrower head gap (more heads) = less wear noise
+        wear_noise *= head_gap_bw_factor;
 
         float dropout_drive = std::clamp(
             vp.dropout_rate + vp.tape_metal_loss * 0.18f + vp.tape_binder_decay * 0.12f + vp.tape_crease * 0.03f,
             0.0f,
             0.25f);
+        // Slower tape speed = weaker signal = more visible dropouts
+        dropout_drive *= (1.0f + (1.0f - tape_spd_bw_factor) * 0.5f);
 
         // S-VHS tape format modifiers: metal particle tape improves signal quality
         if (tape_format_ == TapeFormat::SVHS) {
@@ -200,9 +237,11 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
         float luma_bw_mhz = getLumaBandwidth(tape_format_);
         float chroma_bw_mhz [[maybe_unused]] = getChromaBandwidth(tape_format_);
 
-        // Bandwidth affects smear/persistence: higher BW (S-VHS) = less smear
-        // Normalize to VHS baseline (3.0 MHz luma)
-        float bw_sharpness_factor = luma_bw_mhz / 3.0f;  // 1.0 for VHS, 1.67 for S-VHS
+        float effective_luma_bw = luma_bw_mhz * tape_spd_bw_factor;
+
+        // Bandwidth affects smear/persistence: higher BW = less smear
+        // Normalize to VHS SP baseline (3.0 MHz luma at 15 ips)
+        float bw_sharpness_factor = effective_luma_bw / 3.0f;
 
         // --- Tracking Pulse & Flyback Lock Model ---
         // Simulates control/sync pulse strength that a CRT flyback/H+V oscillator
@@ -307,8 +346,8 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
 
         float v_jitter = 0.0f;
         if (target_error > 0.1f || unlock > 0.05f) {
-            std::mt19937 jRng(uint32_t(frameNum) * 999u);
-            v_jitter = std::normal_distribution<float>(0, std::max<float>(1e-6f, target_error * 10.0f + unlock * 14.0f))(jRng);
+            uint32_t jrng = uint32_t(frameNum) * 999u;
+            v_jitter = xgauss_(jrng) * std::max<float>(1e-6f, target_error * 10.0f + unlock * 14.0f);
         }
 
         int v_roll = (int(v_roll_accum_ + v_jitter)) % H;
@@ -475,14 +514,13 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
 
         int currentField = (frameNum % 2);
         if (currentField != prev_field_) {
-            std::mt19937 fieldRng(uint32_t(frameNum) * 13u);
-            float phase_drift = std::normal_distribution<float>(0, std::max<float>(1e-6f, inter_field_phase_deg * 0.06f))(fieldRng);
+            uint32_t field_rng = uint32_t(frameNum) * 13u;
+            float phase_drift = xgauss_(field_rng) * std::max<float>(1e-6f, inter_field_phase_deg * 0.06f);
             field_chroma_phase_accum_ = field_chroma_phase_accum_ * 0.92f + phase_drift;
             if (head_switch_jitter_deg > 0.01f) {
-                // Brand modifier: Sony has more jitter, Panasonic less
-                float brand_jitter_scale = brand_profile_.head_switch_jitter_lines / 0.3f; // normalize to JVC
-                head_switch_offset_ = std::normal_distribution<float>(0, std::max<float>(1e-6f,
-                    head_switch_jitter_deg * 3.0f * brand_jitter_scale))(fieldRng);
+                float brand_jitter_scale = brand_profile_.head_switch_jitter_lines / 0.3f;
+                head_switch_offset_ = xgauss_(field_rng) * std::max<float>(1e-6f,
+                    head_switch_jitter_deg * 3.0f * brand_jitter_scale);
             } else {
                 head_switch_offset_ = 0.0f;
             }
@@ -501,9 +539,58 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
 
         float head_sweep_px_per_line = helical_sweep_deg * 1.5f;
         float head_sweep_grad = head_sweep_px_per_line / float(W);
-        float hsw_boundary_y = float(H) - 7.0f * float(H) / 240.0f + head_switch_offset_;
 
+        // Tracking alignment error: shifts the head switch boundary
+        float tracking_shift = tracking_phase_error_ * 6.0f;  // Up to ±6 lines
+        float head_switch_shift = tracking_shift;  // Stable offset
+
+        // ── VHS Head Switch Point ─────────────────────────────────────────
+        // The VHS drum has 2 video heads (A/B) that alternately read/write
+        // diagonal tracks. The head switch occurs at a fixed location on the
+        // tape — in the VBI just below the visible picture (line ~250-255 of
+        // the 263-line NTSC field, while visible content is lines ~23-263).
+        //
+        // When tracking is good: the head switch point is hidden in the VBI
+        // below the visible picture, no artifact is visible.
+        //
+        // When tracking fails (v_roll): the tape scrolls vertically, pulling
+        // the VBI into the visible picture. The head switch appears as a
+        // horizontal "tearing line" that scrolls upward from the bottom.
+        //
+        // Head switch artifacts:
+        //   1. RF level collapse (head loses contact momentarily)
+        //   2. Horizontal displacement discontinuity (heads at different angles)
+        //   3. Noise burst (electronic switching transient)
+        //   4. Chroma phase discontinuity (A/B heads have independent chroma AFC)
+        //   5. On 4/6-head VCRs, dedicated slow-mo heads reduce artifacts
+        //
+        // The head switch is ~16 lines below the last visible line on tape.
+        // When v_roll=0 it's off-screen below the bottom. As v_roll increases
+        // it scrolls up into view: y_screen = H + 16 - v_roll.
+        const float hsw_lines_below_picture = 16.0f;
+        float hsw_tape_line = float(H) + hsw_lines_below_picture + head_switch_offset_ + head_switch_shift;
+        float hsw_visible_y = hsw_tape_line - float(v_roll);
+        // Add motor-driven oscillation for worn VCRs
+        hsw_visible_y += motor_defect * 8.0f * std::sin(tapeTime_ * 1.5f * 2.0f * kPI);
+
+        // ── Frame-level Motor State Updates (Moved out of loop for optimization & thread-safety) ──
+        float capstan_wow = 0.0f;
+        if (motor_defect > 0.05f) {
+            capstan_wow_phase_ += (0.5f + motor_defect * 3.0f) * wallDt * 2.0f * kPI;
+            if (capstan_wow_phase_ > 2.0f * kPI) capstan_wow_phase_ -= 2.0f * kPI;
+            capstan_wow = std::sin(capstan_wow_phase_) * motor_defect * 3.0f;
+            capstan_wow += std::sin(capstan_wow_phase_ * 1.7f + 1.3f) * motor_defect * 1.5f;
+
+            motor_belt_slip_phase_ += (0.4f + motor_defect * 1.5f) * wallDt * 2.0f * kPI;
+            if (motor_belt_slip_phase_ > 2.0f * kPI) motor_belt_slip_phase_ -= 2.0f * kPI;
+        }
         
+        float head_azimuth_deg = head_azimuth_shift_ * 5.967f;  // Max ±5.967°
+        float slip_y = std::fmod(motor_belt_slip_phase_ / (2.0f * kPI), 1.0f) * float(H);
+
+
+        float current_h_roll_val = h_roll_phase_ * 0.1f;  // Reduced influence
+        float h_sync_roll_frame = current_h_roll_val * float(W_TOTAL) * (target_error + vp.sync_hold_failure + unlock * 1.2f);
 
 
     out.create(H, W, CV_8UC3);
@@ -511,12 +598,12 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
 #ifdef ADO_OPENMP
 #pragma omp parallel
         {
-            std::vector<float> comp_line;
-            comp_line.resize(W_TOTAL);
-#pragma omp for schedule(dynamic, 16)
+            thread_local static std::vector<float> comp_line;
+            if (comp_line.size() < (size_t)W_TOTAL) comp_line.resize(W_TOTAL);
+#pragma omp for schedule(static)
             for (int y = 0; y < H; ++y) {
-                // rng only used for rare/conditional distributions not in inner-x loop
-                std::mt19937 rng(uint32_t(frameNum) * 65537u + uint32_t(y) * 1013u);
+                // Fast per-scanline RNG (xorshift replaces mt19937)
+                uint32_t rng_state = uint32_t(frameNum) * 65537u + uint32_t(y) * 1013u;
                 const float* nb = noise_buf_.data() + y * W_TOTAL_;
                 int src_y = (y + v_roll) % H;
                 const uchar* sr = in.ptr(src_y);
@@ -547,7 +634,6 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 // screen to skew/squew. This is the classic "head adjustment"
                 // symptom — turning the head alignment screw fixes it.
                 // Real head misalignment is STABLE — it doesn't wobble or flicker.
-                float head_azimuth_deg = head_azimuth_shift_ * 5.967f;  // Max ±5.967°
                 float head_squewing = 0.0f;
                 if (std::abs(head_azimuth_deg) > 0.5f) {
                     // Squewing: horizontal offset that decays from top
@@ -563,42 +649,19 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                     drum_height_ske = drum_tilt_error_ * 20.0f * (y_norm - 0.5f);
                 }
 
-                // Tracking alignment error: shifts the head switch boundary
-                float tracking_shift = tracking_phase_error_ * 6.0f;  // Up to ±6 lines
-                float head_switch_shift = tracking_shift;  // Stable offset
-
                 line_afc += head_squewing + drum_height_ske;
+
                 float flyback_unlock_jitter = unlock * (6.0f + binder_deg * 16.0f + head_wear_deg * 14.0f)
                     * std::sin(float(y) * 0.42f + wallTime_ * 91.0f);
                 float unlock_top_gate = 1.0f - std::exp(-float(y) * 0.06f);
                 line_afc += flyback_unlock_jitter * unlock_top_gate;
 
                 // ── Motor Degradation: Realistic Effects ────────────────────
-                // Motor degradation causes multiple visible artifacts:
-                // 1. Capstan wow/flutter: slow speed variations affecting whole frame
-                // 2. Belt slip: horizontal "bites" through the image at belt rev point
-                // 3. Drum wobble: fine per-line jitter from worn drum bearings
-                // 4. Speed instability: frame rate variation, vertical rolling
-
-                // 1. Capstan wow: slow (0.5-4 Hz) speed variation from motor/belt
-                float capstan_wow = 0.0f;
-                if (motor_defect > 0.05f) {
-                    capstan_wow_phase_ += (0.5f + motor_defect * 3.0f) * wallDt * 2.0f * kPI;
-                    if (capstan_wow_phase_ > 2.0f * kPI) capstan_wow_phase_ -= 2.0f * kPI;
-                    capstan_wow = std::sin(capstan_wow_phase_) * motor_defect * 3.0f;
-                    // Secondary wow component at different frequency
-                    capstan_wow += std::sin(capstan_wow_phase_ * 1.7f + 1.3f) * motor_defect * 1.5f;
-                }
-
-                // 2. Belt slip: horizontal "bite" at belt revolution point
-                // Belt revolves ~every 2 seconds, slip creates a moving distortion band
+                // 1. Capstan wow: already computed at frame level
+                // 2. Belt slip: horizontal "bite" moves through the frame
                 float belt_slip = 0.0f;
+                float line_rf_level = rf_level; // Per-line copy
                 if (motor_defect > 0.05f) {
-                    motor_belt_slip_phase_ += (0.4f + motor_defect * 1.5f) * wallDt * 2.0f * kPI;
-                    if (motor_belt_slip_phase_ > 2.0f * kPI) motor_belt_slip_phase_ -= 2.0f * kPI;
-
-                    // Belt slip position moves through the frame
-                    float slip_y = std::fmod(motor_belt_slip_phase_ / (2.0f * kPI), 1.0f) * float(H);
                     float dist_to_slip = std::abs(float(y) - slip_y);
                     if (dist_to_slip > float(H) / 2.0f) dist_to_slip = float(H) - dist_to_slip;
 
@@ -608,16 +671,13 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                         belt_slip = slip_intensity * std::sin(dist_to_slip * 0.3f + tapeTime_ * 8.0f)
                                   * motor_defect * 15.0f;
                         // Add RF level drop during slip (head loses contact momentarily)
-                        rf_level *= (1.0f - slip_intensity * motor_defect * 0.3f);
+                        line_rf_level *= (1.0f - slip_intensity * motor_defect * 0.3f);
                     }
                 }
 
                 // 3. Drum wobble: fine per-line jitter from worn drum bearings
-                // This is high-frequency (30 Hz = drum rotation rate), small amplitude
                 float drum_wobble = 0.0f;
                 if (motor_defect > 0.05f) {
-                    drum_wobble_phase += 30.0f * wallDt * 2.0f * kPI;
-                    if (drum_wobble_phase > 2.0f * kPI) drum_wobble_phase -= 2.0f * kPI;
                     // Wobble amplitude increases with motor wear
                     float wobble_amp = motor_defect * motor_defect * 4.0f;  // Quadratic for subtle low wear
                     drum_wobble = std::sin(drum_wobble_phase + float(y) * 0.1f) * wobble_amp;
@@ -625,12 +685,11 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                     drum_wobble += std::sin(drum_wobble_phase * 2.0f + 0.7f) * wobble_amp * 0.3f;
                 }
 
-                // 4. Speed instability: causes horizontal stretch/squeeze variation
-                // This modulates the tape speed per-frame, affecting image width
-                motor_speed_var_ = 0.0f;
+                // 4. Speed instability: local copy for use in h_scale
+                float line_motor_speed_var = 0.0f;
                 if (motor_defect > 0.05f) {
-                    motor_speed_var_ = capstan_wow * 0.02f  // Wow contributes to speed
-                                     + belt_slip * 0.005f;   // Belt slip causes momentary speed change
+                    line_motor_speed_var = capstan_wow * 0.02f
+                                         + belt_slip * 0.005f;
                 }
 
                 // Combine all motor effects (will be added to total_h_warp later)
@@ -674,43 +733,78 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 float drum_ecc_offset = drum_ecc_wobble * std::sin(float(y) * 0.03f + drum_ecc_phase_ * 2.0f * kPI);
                 total_h_warp += drum_ecc_offset;
 
-                // --- D. Head Switch Noise (VHS Tearing at bottom of VBI) ---
-                // The head switch boundary position is affected by tracking alignment.
-                // Misaligned tracking shifts the boundary up or down.
-                float hsTearing = 0.0f;
-                float hs_line_offset = motor_defect * 12.0f *
-                    std::sin(tapeTime_ * 1.5f * 2.0f * kPI);
-                // Tracking alignment shifts the head switch boundary
-                hs_line_offset += tracking_phase_error_ * 15.0f;
-                int hs_start = std::max(0, H - 24 + int(hs_line_offset) + int(head_switch_shift));
+                // --- D. VHS Head Switch Artifacts ─────────────────────────
+                // The head switch point is normally hidden in the VBI. When
+                // tracking fails, it scrolls into the visible picture.
+                // Real head switch creates a sharp, localized discontinuity.
 
-                float dist_to_hsw = float(y) - hsw_boundary_y;
-                if (dist_to_hsw > -3.0f && dist_to_hsw < 8.0f) {
-                    float hsw_intensity = 0.0f;
-                    if (dist_to_hsw < 0.0f) {
-                        hsw_intensity = std::pow(1.0f + dist_to_hsw / 3.0f, 2.0f);
-                    } else {
-                        hsw_intensity = std::exp(-dist_to_hsw * 0.5f);
+                float hs_rf_collapse = 0.0f;    // RF level drop at switch point
+                float hs_tear = 0.0f;           // Horizontal displacement
+                float hs_noise = 0.0f;          // Electronic switching noise
+                float hs_chroma_phase = 0.0f;   // Chroma phase jump between heads
+                float hsw_intensity = 0.0f;     // 0-1, how close to switch point
+
+                // Distance from head switch boundary
+                float dist_to_hsw = float(y) - hsw_visible_y;
+
+                // Head switch transient: narrow band ~4 lines wide with
+                // sharp attack and exponential decay
+                if (head_switch_jitter_deg > 0.001f) {
+                    const float hsw_attack_lines = 2.0f;   // sharp attack zone
+                    const float hsw_decay_lines = 6.0f;   // exponential tail
+
+                    if (dist_to_hsw > -hsw_attack_lines && dist_to_hsw < hsw_decay_lines) {
+                        if (dist_to_hsw < 0.0f) {
+                            // Attack phase: sharp rise as head disengages
+                            hsw_intensity = std::pow(1.0f + dist_to_hsw / hsw_attack_lines, 2.0f);
+                        } else {
+                            // Decay phase: exponential tail as new head settles
+                            hsw_intensity = std::exp(-dist_to_hsw * 1.2f / hsw_decay_lines);
+                        }
+                        hsw_intensity *= head_switch_jitter_deg;
+
+                        // Brand modifier: Sharp has larger transients, Panasonic smaller
+                        float hsw_brand_scale = brand_profile_.head_switch_transient_amp / 0.12f;
+                        // 4/6-head VCRs reduce switch artifacts (dedicated slow-mo heads)
+                        if (head_config_.has_slowmo_heads) {
+                            hsw_brand_scale *= 0.5f;
+                        }
+                        hsw_intensity *= hsw_brand_scale;
+
+                        // 1. RF collapse: signal drops as head disengages
+                        hs_rf_collapse = hsw_intensity * 0.8f;
+
+                        // 2. Horizontal tearing: displacement discontinuity
+                        // The two heads are at different physical angles on the drum,
+                        // creating a sudden horizontal offset at the switch point
+                        float hsw_disp_amp = 15.0f + motor_defect * 20.0f;
+                        hs_tear = hsw_intensity * hsw_disp_amp
+                            * std::sin(tapeTime_ * 1.5f * 2.0f * kPI + float(y) * 0.5f);
+
+                        // 3. Noise burst: electronic switching transient
+                        // Sharp impulsive noise at the exact switch point
+                        float switch_spike = std::exp(-std::abs(dist_to_hsw) * 3.0f);
+                        hs_noise = switch_spike * hsw_intensity * 30.0f
+                            * xgauss_(rng_state);
+
+                        // 4. Chroma phase discontinuity between A/B heads
+                        // Each head has independent chroma AFC, creating a
+                        // phase jump at the switch point
+                        hs_chroma_phase = hsw_intensity * 0.4f
+                            * std::sin(wallTime_ * 7.3f + float(frameNum) * 0.7f);
                     }
-                    hsw_intensity *= head_switch_jitter_deg;
-                    // Brand modifier: Sharp has larger head switch transients
-                    float hsw_transient_scale = brand_profile_.head_switch_transient_amp / 0.12f; // normalize to JVC
-                    // 4-head and 6-head VCRs have dedicated slow-mo heads, reducing switch transients
-                    if (head_config_.has_slowmo_heads) {
-                        hsw_transient_scale *= 0.6f; // 40% reduction
-                    }
-                    float hsw_shear = hsw_intensity * 25.0f * hsw_transient_scale
-                        * std::sin(float(y) * 1.7f + tapeTime_ * 120.0f);
-                    float hsw_noise = hsw_intensity * std::normal_distribution<float>(0, 0.4f)(rng);
-                    hsTearing += hsw_shear + hsw_noise * 10.0f;
-                    total_h_warp += hsw_shear * 0.3f;
                 }
 
-                if (y >= hs_start) {
-                    float hsDepth = (float(y) - float(hs_start)) / 24.0f;
-                    float hs_gain = 35.0f + motor_defect * 25.0f;
-                    hsTearing += std::pow(hsDepth, 3.5f) * hs_gain;
-                    if (y >= H-3) hsTearing += std::normal_distribution<float>(0, 8 + motor_defect * 20)(rng);
+                // Secondary head switch artifacts: the "head echo" effect
+                // When the new head first engages, there's a brief settling
+                // period with residual ringing (~8-15 lines after the switch)
+                if (dist_to_hsw > 0.0f && dist_to_hsw < 15.0f && head_switch_jitter_deg > 0.01f) {
+                    float echo_t = dist_to_hsw / 15.0f;
+                    float echo_amp = std::exp(-echo_t * 4.0f) * head_switch_jitter_deg * 0.3f;
+                    // Ringing: damped oscillation as the new head's PLL locks
+                    float echo_ring = std::sin(dist_to_hsw * 0.8f + tapeTime_ * 200.0f) * echo_amp;
+                    hs_tear += echo_ring * 8.0f;
+                    hs_noise += echo_ring * 5.0f;
                 }
 
                 float motor_rf_noise = 0.0f;
@@ -722,7 +816,7 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 // Tracking RF Mask
                 float dist_rf = std::abs(float(src_y) - bar_y);
                 if (dist_rf > (float)H / 2.0f) dist_rf = (float)H - dist_rf; 
-                float tracking_rf = rf_level;
+                float tracking_rf = line_rf_level;
                 if (dist_rf < bar_width) {
                     float min_rf = dist_rf / bar_width;
                     float fade = std::clamp(tracking_error_lpf_ * 10.0f, 0.0f, 1.0f);
@@ -768,9 +862,6 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                     }
                 }
 
-                float current_h_roll = h_roll_phase_ * 0.1f;  // Reduced influence
-                float h_sync_roll = current_h_roll * float(W_TOTAL) * (target_error + vp.sync_hold_failure + unlock * 1.2f);
-
                 float h_sync_shear = 0.0f;
                 if (tracking_error_lpf_ > 0.01f || vp.tape_crease > 0.01f) {
                      // Fast chaotic shear: multiple high-frequency oscillators
@@ -784,8 +875,11 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                      float rf_penalty = (1.0f - tracking_rf) * 5.0f + 1.5f;
                      h_sync_shear = (tracking_error_lpf_ * 100.0f) * chaotic_shear * (rf_penalty + unlock * 1.4f);
                 }
+                
+                float h_sync_roll = h_sync_roll_frame;
 
-                float tbe_start = total_h_warp + beltSlip_legacy + hsTearing + h_sync_roll + h_sync_shear + crease_shear;
+
+                float tbe_start = total_h_warp + beltSlip_legacy + hs_tear + h_sync_roll + h_sync_shear + crease_shear;
 
                 // ── Wow-induced TBE bending ──────────────────────────────────
                 // Real VHS timebase error creates the classic "flagging" bend
@@ -853,18 +947,55 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 if (dropout_drive > 0.002f) {
                     // Probability of at least one dropout per line
                     float line_dropout_prob = dropout_drive * 0.4f;  // scale to visible
-                    std::uniform_real_distribution<float> dropout_rng(0, 1);
-                    std::uniform_real_distribution<float> duration_rng(10, 180);
-                    std::uniform_real_distribution<float> pos_rng(H_BLANK + 10, H_BLANK + W - 30);
-                    if (dropout_rng(rng) < line_dropout_prob) {
+                    if (xorshift_f01(rng_state) < line_dropout_prob) {
                         dropout_active = true;
-                        dropout_duration = 10.0f + dropout_rng(rng) * duration_rng(rng);
-                        dropout_x_pos = pos_rng(rng);
+                        dropout_duration = 10.0f + xorshift_f01(rng_state) * 170.0f;
+                        dropout_x_pos = float(H_BLANK + 10) + xorshift_f01(rng_state) * float(W - 40);
+                    }
+                }
+
+                float encode_phase = linePhase + line_wow_offset + field_phase_offset;
+                float ec = std::cos(encode_phase);
+                float es = std::sin(encode_phase);
+                bool has_motor = motor_defect > 0.05f;
+                bool has_fm_noise = fm_carrier_noise_deg > 0.005f;
+                float inv_WTOTAL = 1.0f / float(W_TOTAL);
+
+                // ── Precompute per-line noise buffers (active region only) ───
+                float luma_noise[W_MAX];
+                float chroma_noise_i[W_MAX];
+                float chroma_noise_q[W_MAX];
+                float fm_noise_samples[W_MAX];
+                for (int xi = 0; xi < W; ++xi) {
+                    float n = nb[xi] * (luma_noise_level * 0.02f);
+                    luma_noise[xi] = n;
+                    chroma_noise_i[xi] = nb[xi + W_TOTAL] * (chroma_noise_level * 0.01f);
+                    chroma_noise_q[xi] = nb[xi + W_TOTAL * 2] * (chroma_noise_level * 0.01f);
+                }
+                if (has_fm_noise) {
+                    for (int xi = 0; xi < W; ++xi) {
+                        fm_noise_samples[xi] = xorshift_f(rng_state);
+                    }
+                }
+
+                // Precompute dropout per line (not per pixel)
+                bool line_dropout_triggered = false;
+                if (crease_dropout_prob > 0.001f) {
+                    line_dropout_triggered = xorshift_f01(rng_state) < crease_dropout_prob * 0.05f;
+                }
+
+                // Precompute wear spark positions (sparse, not per pixel)
+                bool wear_spark_active = false;
+                float wear_spark_x = 0.0f;
+                if (wear_noise > 0.35f && wear_noise * 0.03f > 0.01f) {
+                    wear_spark_active = xorshift_f01(rng_state) < wear_noise * 0.03f;
+                    if (wear_spark_active) {
+                        wear_spark_x = float(H_BLANK) + xorshift_f01(rng_state) * float(W);
                     }
                 }
 
                 for (int x = 0; x < W_TOTAL; ++x) {
-                    float current_tbe = tbe_start + (float(x) / float(W_TOTAL)) * tbe_slope;
+                    float current_tbe = tbe_start + float(x) * inv_WTOTAL * tbe_slope;
 
                     // Horizontal squeeze/stretch based on tape speed deviation.
                     // When tape runs slower than nominal, the image stretches horizontally
@@ -872,37 +1003,124 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                     // Motor degradation adds speed instability, causing the squeeze/stretch
                     // to fluctuate per-frame.
                     float h_scale = 1.0f + speed_dev * (instantSpd < safeTapeSpd ? 0.15f : -0.12f);
-                    h_scale += motor_speed_var_;  // Motor speed instability
+                    h_scale += line_motor_speed_var;  // Motor speed instability
                     h_scale = std::clamp(h_scale, 0.7f, 1.3f);
 
-                    // Tearing: at low tape speeds, the image tears into horizontal bands
-                    // with sudden horizontal offsets. Worse when tape is very slow.
-                    float tear_amount = 0.0f;
+                    // ── User-Controlled Line-by-Line Horizontal Tearing ──────
+                    // Real VHS tracking loss and head switching create horizontal
+                    // tear bands — discrete line groups that shift independently.
+                    // Multiple overlapping oscillators at different frequencies
+                    // produce chaotic, organic-looking tearing.
+                    float user_tear = 0.0f;
+                    if (vp.horizontal_tearing > 0.005f) {
+                        float tear_deg = std::clamp(vp.horizontal_tearing, 0.0f, 1.0f);
+
+                        // Tear band phase advances slowly, creating scrolling bands
+                        tear_band_phase_ = std::fmod(tear_band_phase_ + wallDt * 0.37f, 1.0f);
+
+                        // Primary tear bands: 3-8 bands scrolling vertically
+                        int num_bands = 3 + int(tear_deg * 5.0f);
+                        float band_h = float(H) / float(num_bands);
+                        float band_center = tear_band_phase_ * band_h;
+                        float dist_to_band = std::abs(float(y) - band_center);
+                        // Wrap distance
+                        if (dist_to_band > band_h * 0.5f) dist_to_band = band_h - dist_to_band;
+
+                        // Also check all bands (not just the scrolling center one)
+                        float total_tear = 0.0f;
+                        for (int b = 0; b < num_bands; ++b) {
+                            float b_center = float(b) * band_h + std::sin(wallTime_ * 0.7f + float(b) * 1.3f) * band_h * 0.3f;
+                            // Wrap
+                            while (b_center < 0.0f) b_center += float(H);
+                            while (b_center >= float(H)) b_center -= float(H);
+
+                            float d = std::abs(float(y) - b_center);
+                            if (d > float(H) * 0.5f) d = float(H) - d;
+
+                            float band_edge = band_h * 0.08f; // sharp band edges
+                            if (d < band_edge) {
+                                float edge_t = d / band_edge;
+                                float band_amp = std::pow(1.0f - edge_t, 2.0f);
+                                // Each band has independent horizontal offset
+                                uint32_t b_seed = uint32_t(b) * 2654435761u + uint32_t(frameNum) * 65537u;
+                                b_seed ^= b_seed << 13; b_seed ^= b_seed >> 17; b_seed ^= b_seed << 5;
+                                float band_off = (float(int32_t(b_seed) % 80) - 40.0f);
+                                // Oscillating wobble per band
+                                band_off += std::sin(wallTime_ * 2.3f + float(b) * 2.7f) * 12.0f;
+                                band_off += nb[3] * 8.0f; // noise
+                                total_tear += band_amp * band_off * tear_deg * 0.6f;
+                            }
+                        }
+
+                        // Secondary micro-tearing: fine per-line jitter
+                        float micro_tear = nb[0] * tear_deg * 6.0f;
+                        micro_tear += std::sin(float(y) * 0.8f + wallTime_ * 11.0f) * tear_deg * 4.0f;
+                        micro_tear += std::cos(float(y) * 1.3f - wallTime_ * 7.0f) * tear_deg * 3.0f;
+
+                        user_tear = total_tear + micro_tear;
+                    }
+
+                    // Legacy tape-speed-based tearing (kept for backward compatibility)
+                    float tape_speed_tear = 0.0f;
                     if (safeTapeSpd < 0.9f) {
                         float tear_strength = (0.9f - safeTapeSpd) * 25.0f;
-                        // Create 3-5 tear bands across the frame
                         int num_tear_bands = 3 + int(tear_strength);
                         float band_height = float(H) / float(num_tear_bands);
                         int current_band = int(float(y) / band_height);
-                        // Each band gets a random offset
                         uint32_t tear_seed = uint32_t(current_band) * 2654435761u + uint32_t(frameNum) * 65537u;
                         tear_seed ^= tear_seed << 13; tear_seed ^= tear_seed >> 17; tear_seed ^= tear_seed << 5;
-                        tear_amount = (float(int32_t(tear_seed) % 40) - 20.0f) * tear_strength * 0.3f;
-                        // Tearing is more visible in the middle of the frame
+                        tape_speed_tear = (float(int32_t(tear_seed) % 40) - 20.0f) * tear_strength * 0.3f;
                         float y_norm = float(y) / float(H);
-                        tear_amount *= std::sin(y_norm * 3.14159f);
+                        tape_speed_tear *= std::sin(y_norm * 3.14159f);
                     }
 
-                    // Skewing: at low tape speeds, the image skews (parallelogram distortion)
-                    // The amount of skew increases from top to bottom
-                    float skew_amount = 0.0f;
+                    float tear_amount = user_tear + tape_speed_tear;
+
+                    // ── User-Controlled Line-by-Line Skewing ─────────────────
+                    // Real VCR timebase error causes each scanline to start at
+                    // a slightly different horizontal position. When the skew
+                    // is severe, the image becomes a parallelogram with
+                    // wavy, jagged edges.
+                    float user_skew = 0.0f;
+                    if (vp.line_skew > 0.005f) {
+                        float skew_deg = std::clamp(vp.line_skew, 0.0f, 1.0f);
+
+                        // Skew wave phase advances slowly
+                        skew_wave_phase_ = std::fmod(skew_wave_phase_ + wallDt * 0.23f, 1.0f);
+
+                        // Base skew: horizontal offset proportional to line number
+                        // Creates parallelogram distortion
+                        float y_norm = float(y) / float(H);
+                        float base_skew = y_norm * skew_deg * 50.0f;
+
+                        // Wavy skew: sinusoidal modulation makes the edge wavy
+                        float wave_skew = std::sin(y_norm * 12.0f + wallTime_ * 1.7f + skew_wave_phase_ * 2.0f * kPI)
+                                        * skew_deg * 18.0f;
+
+                        // Secondary wave for more organic look
+                        float wave2_skew = std::cos(y_norm * 7.0f - wallTime_ * 2.3f)
+                                         * skew_deg * 10.0f;
+
+                        // Micro-skew: fine per-line jitter
+                        float micro_skew = nb[1] * skew_deg * 4.0f;
+                        micro_skew += std::sin(float(y) * 1.1f + wallTime_ * 13.0f) * skew_deg * 3.0f;
+
+                        // Top-of-screen AFC pull-in reduces skew at top
+                        float top_gate = 1.0f - std::exp(-float(y) * 0.05f);
+
+                        user_skew = (base_skew + wave_skew + wave2_skew + micro_skew) * top_gate;
+                    }
+
+                    // Legacy tape-speed-based skewing (kept for backward compatibility)
+                    float tape_speed_skew = 0.0f;
                     if (safeTapeSpd < 0.95f) {
                         float skew_strength = (0.95f - safeTapeSpd) * 60.0f;
-                        float y_norm = float(y) / float(H);
-                        skew_amount = skew_strength * y_norm * y_norm;
-                        // Add slight wobble to the skew
-                        skew_amount += std::sin(tapeTime_ * 2.0f + y_norm * 6.0f) * skew_strength * 0.15f;
+                        float y_norm_legacy = float(y) / float(H);
+                        tape_speed_skew = skew_strength * y_norm_legacy * y_norm_legacy;
+                        tape_speed_skew += std::sin(tapeTime_ * 2.0f + y_norm_legacy * 6.0f) * skew_strength * 0.15f;
                     }
+
+                    float skew_amount = user_skew + tape_speed_skew;
 
                     float xSrcCentered = (float(x) - float(W_TOTAL) * 0.5f) / h_scale + float(W_TOTAL) * 0.5f;
                     float xSrc = xSrcCentered - current_tbe - tear_amount - skew_amount;
@@ -913,7 +1131,7 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                     // The VCR handles subcarrier frequency conversion internally.
                     // We encode at the nominal 227.5 cycles/line with tiny
                     // per-line phase offsets simulating mechanical residuals.
-                    float theta = linePhase + float(x) * kSC_PX + line_wow_offset + field_phase_offset;
+                    float theta = encode_phase + float(x) * kSC_PX;
 
                     float Y = 0.0f, I = 0.0f, Q = 0.0f;
 
@@ -923,10 +1141,10 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                         Y = 0.0f;  // Burst
                         I = 0.0f; Q = 0.35f;
                     } else if (activeSrc) {
-                        if (std::uniform_real_distribution<float>(0, 1)(rng) < crease_dropout_prob * 0.05f) {
+                        if (line_dropout_triggered) {
                             d_tail = 1.0f;
                         }
-                        
+
                         float vX = std::clamp(xSrc - H_BLANK, 0.f, float(W - 1.001f));
                         int x0 = (int)vX;
                         float r = sr[x0 * 3 + 2] / 255.f;
@@ -939,17 +1157,25 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
 
                         I *= chroma_attenuation;
                         Q *= chroma_attenuation;
-                        Y += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (luma_noise_level * 0.02f);
-                        I += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (chroma_noise_level * 0.01f);
-                        Q += std::normal_distribution<float>(0.0f, 1.0f)(rng) * (chroma_noise_level * 0.01f);
 
-                        if (motor_defect > 0.05f) {
+                        // Use precomputed noise instead of per-pixel rng
+                        int ni = x - H_BLANK;
+                        if (ni >= 0 && ni < W) {
+                            Y += luma_noise[ni];
+                            I += chroma_noise_i[ni];
+                            Q += chroma_noise_q[ni];
+                        }
+
+                        if (has_motor) {
                             Y += motor_rf_noise * 0.03f;
                         }
 
-                        if (fm_carrier_noise_deg > 0.005f) {
+                        if (has_fm_noise) {
                             float fm_dev = fm_carrier_noise_deg * 0.012f;
-                            fm_noise_lpf += fm_dev * (std::uniform_real_distribution<float>(-1, 1)(rng) - fm_noise_lpf);
+                            int ni2 = x - H_BLANK;
+                            if (ni2 >= 0 && ni2 < W) {
+                                fm_noise_lpf += fm_dev * (fm_noise_samples[ni2] - fm_noise_lpf);
+                            }
                             Y += fm_noise_lpf * 0.3f;
                             float fm_chroma_mod = fm_noise_lpf * 0.15f;
                             I += fm_chroma_mod * std::cos(theta * 0.5f);
@@ -961,33 +1187,51 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                             I *= (1.0f - d_tail); Q *= (1.0f - d_tail);
                             d_tail *= 0.92f;
                         }
-                    }
-                    if (tracking_rf < 0.95f && activeSrc) {
-                         Y *= tracking_rf; I *= tracking_rf; Q *= tracking_rf;
-                         float noise_amp = 1.0f - tracking_rf;
-                         Y += std::uniform_real_distribution<float>(-0.8f, 0.8f)(rng) * noise_amp;
-                         if (noise_amp > 0.35f) { I *= 0.2f; Q *= 0.2f; }
-                    }
 
-                    if (dropout_active && activeSrc) {
-                        float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
-                        if (dist_to_dropout < dropout_duration * 0.5f) {
-                            float edge_dist = std::min(
-                                std::abs(dist_to_dropout - dropout_duration * 0.5f + 3.0f),
-                                std::abs(dist_to_dropout + dropout_duration * 0.5f - 3.0f)
-                            );
-                            if (edge_dist < 3.0f) {
-                                Y = 1.0f + std::uniform_real_distribution<float>(-0.3f, 0.5f)(rng);
-                                I = 0.0f; Q = 0.0f;
-                            } else {
-                                Y = -0.1f + std::uniform_real_distribution<float>(0, 1)(rng) * 0.15f;
-                                I = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
-                                Q = std::uniform_real_distribution<float>(-0.05f, 0.05f)(rng);
+                        if (wear_spark_active) {
+                            float dist_to_spark = std::abs(float(x) - wear_spark_x);
+                            if (dist_to_spark < 3.0f) {
+                                Y += -0.35f + 0.9f * xorshift_f01(rng_state);
+                            }
+                            if (hs_rf_collapse > 0.001f) {
+                                tracking_rf *= (1.0f - hs_rf_collapse);
+                                Y += hs_noise * 0.05f;
+                            }
+                            if (tracking_rf < 0.95f) {
+                                 Y *= tracking_rf; I *= tracking_rf; Q *= tracking_rf;
+                                 float noise_amp = 1.0f - tracking_rf;
+                                 int ni = x - H_BLANK;
+                                 float track_noise = (ni >= 0 && ni < W) ? luma_noise[ni] * 20.0f : 0.0f;
+                                 Y += track_noise * noise_amp;
+                                 if (noise_amp > 0.35f) { I *= 0.2f; Q *= 0.2f; }
+                            }
+                            if (dropout_active) {
+                                float dist_to_dropout = std::abs(float(x) - dropout_x_pos);
+                                if (dist_to_dropout < dropout_duration * 0.5f) {
+                                    float edge_dist = std::min(
+                                        std::abs(dist_to_dropout - dropout_duration * 0.5f + 3.0f),
+                                        std::abs(dist_to_dropout + dropout_duration * 0.5f - 3.0f)
+                                    );
+                                    if (edge_dist < 3.0f) {
+                                        int ni = x - H_BLANK;
+                                        float dropout_noise = (ni >= 0 && ni < W) ? luma_noise[ni] * 25.0f : 0.0f;
+                                        Y = 1.0f + dropout_noise * 0.02f;
+                                        I = 0.0f; Q = 0.0f;
+                                    } else {
+                                        int ni = x - H_BLANK;
+                                        float dn = (ni >= 0 && ni < W) ? luma_noise[ni] : 0.0f;
+                                        Y = -0.1f + (dn * 0.5f + 0.5f) * 0.15f;
+                                        I = dn * 0.025f;
+                                        Q = dn * 0.025f;
+                                    }
+                                }
                             }
                         }
                     }
 
-                    comp_line[x] = Y + I * std::cos(theta) - Q * std::sin(theta);
+                    float c = ec * sc_cos_[x] - es * sc_sin_[x];
+                    float s = es * sc_cos_[x] + ec * sc_sin_[x];
+                    comp_line[x] = Y + I * c - Q * s;
                 }
 
                 // ── FM Luma Encode → Tape → Decode (Phase 2) ────────────────
@@ -1002,14 +1246,26 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 float phase_accum = 0.0f;
 
                 float sumI = 0.f, sumQ = 0.f;
-                for (int x = 70; x < 110; ++x) {
-                    float refTheta = linePhase + float(x) * kSC_PX;
-                    sumI += comp_line[x] * std::cos(refTheta);
-                    sumQ -= comp_line[x] * std::sin(refTheta);
+                {
+                    float burst_ct = std::cos(linePhase);
+                    float burst_st = std::sin(linePhase);
+                    for (int x = 70; x < 110; ++x) {
+                        float c = burst_ct * sc_cos_[x] - burst_st * sc_sin_[x];
+                        float s = burst_st * sc_cos_[x] + burst_ct * sc_sin_[x];
+                        sumI += comp_line[x] * c;
+                        sumQ -= comp_line[x] * s;
+                    }
                 }
                 phase_accum = std::atan2(sumQ, sumI) - (kPI / 2.0f);
 
                 phase_accum += field_chroma_error;
+
+                // ── Head switch chroma phase discontinuity ───────────────────
+                // Each video head has independent chroma AFC circuitry. At the
+                // head switch point, the phase reference jumps between heads,
+                // creating a visible hue shift that decays as the new head's
+                // PLL settles.
+                phase_accum += hs_chroma_phase;
 
                 // Real TV PLL loses lock during speed changes. The burst signal
                 // is shifted in frequency by tape speed mismatch, causing the PLL
@@ -1019,48 +1275,55 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 float pll_speed_error = speed_dev * 1.2f
                     + std::abs(instantSpd - 1.0f) * 0.4f;
 
+                // ── Precompute sin/cos lookup table for decode loop ──────────
+                // Use angle-addition from frame-level sc_cos_/sc_sin_ LUTs
+                // to eliminate 1280 trig calls per scanline.
+                float cos_table[W_MAX];
+                float sin_table[W_MAX];
+                float baseTheta = linePhase + float(H_BLANK) * kSC_PX + phase_accum
+                                + field_phase_offset + pll_speed_error;
+                {
+                    float ct = std::cos(baseTheta);
+                    float st = std::sin(baseTheta);
+                    for (int xi = 0; xi < W; ++xi) {
+                        cos_table[xi] = ct * sc_cos_[H_BLANK + xi] - st * sc_sin_[H_BLANK + xi];
+                        sin_table[xi] = st * sc_cos_[H_BLANK + xi] + ct * sc_sin_[H_BLANK + xi];
+                    }
+                }
+
                 float lpY = 0.f, si = 0.f, sq = 0.f;
                 const float lpfA = 0.35f;
                 const float chrA = 0.12f;
 
                 float prev_r = 0.0f, prev_g = 0.0f, prev_b = 0.0f;
                 bool has_prev = false;
+
+                // Hoist azimuth crosstalk outside pixel loop: cos(π) = -1, sin(π) = 0
+                float crosstalk_i = 0.0f, crosstalk_q = 0.0f;
+                if (chroma_crosstalk_deg > 0.005f) {
+                    float xt_amp = chroma_crosstalk_deg * 0.15f;
+                    crosstalk_i = -prev_line_luma_[0] * xt_amp;
+                    crosstalk_q = -prev_line_luma_[1] * xt_amp;
+                }
+
                 for (int out_x = 0; out_x < W; ++out_x) {
                     int x = out_x + H_BLANK;
                     float sig = comp_line[x];
 
-                    // Color burst (x=70-110) sets the subcarrier phase reference.
-                    // The PLL extracts line_wow_offset from the burst and stores
-                    // it in phase_accum. During speed changes the PLL accumulates
-                    // a uniform per-line phase error (pll_speed_error), reducing
-                    // chroma amplitude without spatial hue variation.
-                    float decTheta = linePhase + float(x) * kSC_PX + phase_accum
-                                   + field_phase_offset + pll_speed_error;
+                    float cosVal = cos_table[out_x];
+                    float sinVal = sin_table[out_x];
 
                 lpY += lpfA * (sig - lpY);
 
-                // 3. Demodulate Chroma
                 float chromaSig = sig - lpY;
-                float rawI = 2.0f * chromaSig * std::cos(decTheta);
-                float rawQ = -2.0f * chromaSig * std::sin(decTheta);
+                float rawI = 2.0f * chromaSig * cosVal;
+                float rawQ = -2.0f * chromaSig * sinVal;
 
                 si += chrA * (rawI - si);
                 sq += chrA * (rawQ - sq);
 
-                // Azimuth crosstalk: adjacent track chroma leaks through with
-                // phase inversion. 6-head VCRs reduce this by 25% via Hi-Fi heads.
-                // The crosstalk appears as a ghost of the previous line's chroma
-                // with a 180-degree phase shift (azimuth rejection failure).
-                if (chroma_crosstalk_deg > 0.005f) {
-                    float crosstalk_phase = kPI;  // 180-degree phase shift
-                    float prevLineI = prev_line_luma_[0];  // store I from prev line
-                    float prevLineQ = prev_line_luma_[1];  // store Q from prev line
-                    float xtI = prevLineI * std::cos(crosstalk_phase) - prevLineQ * std::sin(crosstalk_phase);
-                    float xtQ = prevLineI * std::sin(crosstalk_phase) + prevLineQ * std::cos(crosstalk_phase);
-                    float xt_amp = chroma_crosstalk_deg * 0.15f;
-                    si += xtI * xt_amp;
-                    sq += xtQ * xt_amp;
-                }
+                si += crosstalk_i;
+                sq += crosstalk_q;
 
                 // 4. Transform back to RGB
                 float r = lpY + 0.956f * si + 0.621f * sq;
@@ -1072,8 +1335,8 @@ void NTSCSimulator::process(const cv::Mat& in, cv::Mat& out, int frameNum, const
                 g += snow;
                 b += snow;
 
-                if (wear_noise > 0.35f && std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < wear_noise * 0.03f) {
-                    float spark = std::uniform_real_distribution<float>(-0.35f, 0.55f)(rng);
+                if (wear_noise > 0.35f && xorshift_f01(rng_state) < wear_noise * 0.03f) {
+                    float spark = -0.35f + 0.9f * xorshift_f01(rng_state);
                     r += spark;
                     g += spark;
                     b += spark;

@@ -129,10 +129,14 @@ if(MSVC)
     )
 else()
     target_compile_options(ado8500 PRIVATE
-        $<$<CONFIG:Release>:-O3 -march=native -ffast-math -funroll-loops>
+        $<$<CONFIG:Release>:-O3 -march=native -mavx2 -ffast-math -funroll-loops -fno-signaling-nans -flto>
         $<$<CONFIG:Debug>:-O0 -g>
         -Wall -Wextra -Wno-unused-parameter
     )
+    # Link-time optimization for Release builds
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_link_options(ado8500 PRIVATE -flto)
+    endif()
     if(ADO_ASAN AND CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(ado8500 PRIVATE -fsanitize=address)
         target_link_options(ado8500 PRIVATE -fsanitize=address)
@@ -141,6 +145,30 @@ else()
         target_compile_options(ado8500 PRIVATE -fsanitize=thread)
         target_link_options(ado8500 PRIVATE -fsanitize=thread)
     endif()
+endif()
+
+# ── Benchmark target ──────────────────────────────
+add_executable(bench_ntsc bench_ntsc.cpp src/ntsc_simulator.cpp src/fm_luma.cpp src/color_under.cpp src/vcr_audio.cpp src/tape_degradation.cpp)
+target_compile_definitions(bench_ntsc PRIVATE ADO_OPENMP)
+target_include_directories(bench_ntsc PRIVATE
+    ${SDL2_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+    ${CAPSTANVAR_INCLUDE}
+)
+target_link_libraries(bench_ntsc PRIVATE
+    ${SDL2_LIBRARIES}
+    ${OpenCV_LIBS}
+    ${CMAKE_DL_LIBS}
+    pthread
+)
+if(ADO_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(bench_ntsc PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_compile_options(bench_ntsc PRIVATE
+    $<$<CONFIG:Release>:-O3 -march=native -mavx2 -ffast-math -funroll-loops -fno-signaling-nans -flto>
+)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_link_options(bench_ntsc PRIVATE -flto)
 endif()
 
 message(STATUS "ADO-8500 configured. Build with:")

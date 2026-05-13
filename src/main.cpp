@@ -433,6 +433,9 @@ private:
     std::atomic<float> fps_{0.f};
     int                frameNum_{0};
     cv::Mat            fieldDisplay_;
+    // Pre-allocated buffers for main loop
+    cv::Mat            workRaw_buf, eff_buf, proc_buf, resized_buf;
+    cv::Mat            crop_buf;  // For cropping without clone
 
     void loop(ProcessParams& pp){
         auto tPrev=std::chrono::steady_clock::now();int fpsCount=0;
@@ -476,9 +479,11 @@ private:
                 if(raw.empty()) continue;
                 
                 // ── Crop to 4:3 (center-crop) PRE-RESIZE ──────────────────────
+                // Optimize: avoid clone by using reference assignment
                 int sw = raw.cols, sh = raw.rows;
                 float srcAR = float(sw) / float(sh);
                 constexpr float kAR43 = 4.f / 3.f;
+                cv::Mat* pRaw = &raw;
                 if (std::abs(srcAR - kAR43) > 0.02f) {
                     int cw, ch;
                     if (srcAR > kAR43) { ch = sh; cw = int(sh * kAR43); }
@@ -486,9 +491,10 @@ private:
                     int ox = std::clamp((sw - cw) / 2, 0, sw-1);
                     int oy = std::clamp((sh - ch) / 2, 0, sh-1);
                     cw = std::clamp(cw, 1, sw-ox); ch = std::clamp(ch, 1, sh-oy);
-                    raw = raw(cv::Rect(ox, oy, cw, ch)).clone();
+                    crop_buf = raw(cv::Rect(ox, oy, cw, ch));
+                    pRaw = &crop_buf;
                 }
-                last_raw = raw;
+                last_raw = *pRaw;
             }
             Effects::Params fx; bool ntscOn; EngineParams ep{}; VideoParams vp{}; TVParams tv{}; float spd=1.f; float iSpd=1.f;
             bool hasEng=false; int si=0;
@@ -497,14 +503,14 @@ private:
              hasEng=pp.engValid;si=pp.spdIdx.load();}
             if(!hasEng){switch(si){case 1:ep.ips_base=7.5f;break;case 2:ep.ips_base=3.75f;break;default:ep.ips_base=15.f;}}
             static float ph=0.f; ph += 0.30f / kNTSC_FIELD_HZ; if(ph>1.f)ph-=1.f; fx.phase=ph;
-            cv::Mat workRaw;
+            
+            // Resize to processing size - reuse pre-allocated buffer
             if(raw.cols != PROCESS_W || raw.rows != PROCESS_H) {
-                cv::resize(raw, workRaw, {PROCESS_W, PROCESS_H}, 0, 0, cv::INTER_AREA);
+                cv::resize(raw, workRaw_buf, {PROCESS_W, PROCESS_H}, 0, 0, cv::INTER_AREA);
             } else {
-                workRaw = raw;
+                workRaw_buf = raw;
             }
-            cv::Mat eff,proc;
-            Effects::apply(workRaw,eff,fx);
+            Effects::apply(workRaw_buf, eff_buf, fx);
 
             // Real wall-clock delta for NTSC oscillators
             auto wallNow = std::chrono::steady_clock::now();
@@ -518,7 +524,7 @@ private:
             if(ntscOn){
                 if(!hasEng){EngineParams def{};def.ips_base=15.f;def.hiss=.003f;def.wow_dep=.3f;def.flutter_dep=.08f;
                     ntsc_.tapeTime_ = (float)frameNum_ / kNTSC_FIELD_HZ;
-                    ntsc_.process(eff,proc,frameNum_,def,vp,tv,1.f,1.f,wallDt);}
+                    ntsc_.process(eff_buf,proc_buf,frameNum_,def,vp,tv,1.f,1.f,wallDt);}
                 else {
                     float syncOffset = pp.av_sync_offset_ms;
                     int64_t latencyComp = int64_t(syncOffset * AUDIO_SR / 1000.0f);
@@ -526,37 +532,34 @@ private:
 
                     float histSpd = spd;
                     ntsc_.tapeTime_ = (float)adjApos / AUDIO_SR;
-                    ntsc_.process(eff,proc,frameNum_,ep,vp,tv,spd,histSpd,wallDt);
+                    ntsc_.process(eff_buf,proc_buf,frameNum_,ep,vp,tv,spd,histSpd,wallDt);
                 }}
-
-
-
-            else proc=eff;
-
-            if(proc.cols != FW || proc.rows != FH) {
-                cv::Mat up;
-                cv::resize(proc, up, {FW, FH}, 0, 0, cv::INTER_LINEAR);
-                proc = std::move(up);
+            else {
+                proc_buf = eff_buf;
             }
 
+            // Resize output to final size if needed - reuse buffer
+            if(proc_buf.cols != FW || proc_buf.rows != FH) {
+                cv::resize(proc_buf, resized_buf, {FW, FH}, 0, 0, cv::INTER_LINEAR);
+                proc_buf = resized_buf;
+            }
+
+            // Optimized field display: avoid clone by using direct assignment
             if(ntscOn) {
-                if(fieldDisplay_.empty() || fieldDisplay_.size()!=proc.size() || fieldDisplay_.type()!=proc.type()) {
-                    proc.copyTo(fieldDisplay_);
+                if(fieldDisplay_.empty() || fieldDisplay_.size()!=proc_buf.size()) {
+                    fieldDisplay_ = proc_buf;
                 } else {
                     int fieldParity = frameNum_ & 1;
-                    for(int y=fieldParity; y<proc.rows; y+=2) {
-                        proc.row(y).copyTo(fieldDisplay_.row(y));
+                    for(int y=fieldParity; y<proc_buf.rows; y+=2) {
+                        proc_buf.row(y).copyTo(fieldDisplay_.row(y));
                     }
-                    proc = fieldDisplay_.clone();
+                    proc_buf = fieldDisplay_;
                 }
             } else {
                 fieldDisplay_ = cv::Mat{};
             }
 
-            // Recording hook removed - now handled asynchronously in recordThread
-
-
-            outQ.push(std::move(proc));++frameNum_;++fpsCount;
+            outQ.push(std::move(proc_buf));++frameNum_;++fpsCount;
             auto now=std::chrono::steady_clock::now();float dt=std::chrono::duration<float>(now-tPrev).count();
             if(dt>=1.f){fps_=fpsCount/dt;fpsCount=0;tPrev=now;}}
     }
@@ -1242,6 +1245,8 @@ static void drawUI(AppState& app, SDL_Renderer* ren){
     sl3("TRACKING ALIGN",&app.videoParams.tracking_alignment,0,1);
     sl3("DRUM HEIGHT",&app.videoParams.drum_height_error,0,1);
     sl3("AUDIO HEAD",&app.videoParams.audio_head_alignment,0,1);
+    sl3("H-TEARING",&app.videoParams.horizontal_tearing,0,1);
+    sl3("LINE SKEW",&app.videoParams.line_skew,0,1);
     ImGui::EndDisabled();
 
     {

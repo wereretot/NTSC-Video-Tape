@@ -417,6 +417,8 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
     sl3("TRACKING ALIGN", &app.videoParams.tracking_alignment, 0, 1);
     sl3("DRUM HEIGHT", &app.videoParams.drum_height_error, 0, 1);
     sl3("AUDIO HEAD", &app.videoParams.audio_head_alignment, 0, 1);
+    sl3("H-TEARING", &app.videoParams.horizontal_tearing, 0, 1);
+    sl3("LINE SKEW", &app.videoParams.line_skew, 0, 1);
     {
         std::lock_guard<std::mutex> lk2(app.pp.mu);
         app.pp.epSnap = bp;

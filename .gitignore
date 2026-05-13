@@ -2,3 +2,4 @@
 /.qwen
 # CapstanVar experimental branch
 /CapstanVar
+/build_release
