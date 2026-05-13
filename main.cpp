@@ -27,7 +27,8 @@ int main(int, char**) {
         SDL_Log("Window: %s", SDL_GetError());
         return 1;
     }
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!ren) {
         SDL_Log("Renderer: %s", SDL_GetError());
         return 1;
@@ -59,12 +60,11 @@ int main(int, char**) {
             SDL_Log("AudioIO: Failed to open");
             return;
         }
-        aio->play_forward();
-        eng->is_playing.store(true);
-
         aio->set_capture_callback([&app](const std::vector<float>& samples) {
             app.audioCaptureQ.push(samples);
         });
+        aio->play_forward();
+        eng->is_playing.store(true);
 
         {
             std::lock_guard<std::mutex> lk(app.audioMu);
@@ -118,9 +118,6 @@ int main(int, char**) {
         cv::Mat out;
         while (drainRun) {
             if (app.pipeline.outQ.pop(out, 10)) {
-                if (app.exportCtx.active && !app.exportCtx.isClosing) {
-                    app.recordQ.push(out.clone());
-                }
                 {
                     std::lock_guard<std::mutex> lk(app.frameMu);
                     app.lastOut = out;
@@ -133,6 +130,7 @@ int main(int, char**) {
     std::thread recordThread([&] {
         cv::Mat f;
         std::vector<float> residue;
+        double audioAcc = 0.0;
         while (recordRun) {
             if (app.recordQ.pop(f, 20)) {
                 std::lock_guard<std::mutex> wlk(app.exportCtx.writerMu);
@@ -141,12 +139,15 @@ int main(int, char**) {
                     app.exportCtx.frameCount++;
 
                     if (app.exportCtx.audioFp) {
-                        double totalExpected = (double)app.exportCtx.frameCount * (SR / kNTSC_FPS);
-                        int toWriteTotal = (int)totalExpected - (int)app.exportCtx.audioFramesWritten;
+                        // Calculate samples needed for standard 60.0 fps
+                        audioAcc += (double)SR / 60.0;
+                        int toWriteTotal = (int)audioAcc;
+                        audioAcc -= toWriteTotal;
 
                         if (toWriteTotal > 0) {
                             std::vector<int16_t> pcm;
                             pcm.reserve(toWriteTotal * 2);
+                            
                             int fromRes = std::min((int)residue.size() / 2, toWriteTotal);
                             for (int i = 0; i < fromRes * 2; ++i) {
                                 float s = residue[i];
@@ -155,28 +156,30 @@ int main(int, char**) {
                                 pcm.push_back((int16_t)(s * 32767.f));
                             }
                             residue.erase(residue.begin(), residue.begin() + fromRes * 2);
+                            
                             int remaining = toWriteTotal - fromRes;
-                            std::vector<float> block;
-                            while (remaining > 0 && app.audioCaptureQ.try_pop(block)) {
-                                int fromBlock = std::min((int)block.size() / 2, remaining);
-                                for (int i = 0; i < fromBlock * 2; ++i) {
-                                    float s = block[i];
-                                    if (s > 1.f) s = 1.f;
-                                    if (s < -1.f) s = -1.f;
-                                    pcm.push_back((int16_t)(s * 32767.f));
+                            while (remaining > 0) {
+                                std::vector<float> block;
+                                if (app.audioCaptureQ.try_pop(block)) {
+                                    int fromBlock = std::min((int)block.size() / 2, remaining);
+                                    for (int i = 0; i < fromBlock * 2; ++i) {
+                                        float s = block[i];
+                                        if (s > 1.f) s = 1.f;
+                                        if (s < -1.f) s = -1.f;
+                                        pcm.push_back((int16_t)(s * 32767.f));
+                                    }
+                                    if (fromBlock * 2 < (int)block.size()) {
+                                        residue.insert(residue.end(), block.begin() + fromBlock * 2, block.end());
+                                    }
+                                    remaining -= fromBlock;
+                                } else {
+                                    for (int i = 0; i < remaining * 2; ++i) pcm.push_back(0);
+                                    remaining = 0;
                                 }
-                                if (fromBlock * 2 < (int)block.size()) {
-                                    residue.insert(residue.end(), block.begin() + fromBlock * 2, block.end());
-                                }
-                                remaining -= fromBlock;
-                            }
-                            if (remaining > 0) {
-                                for (int i = 0; i < remaining * 2; ++i) pcm.push_back(0);
                             }
                             std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), app.exportCtx.audioFp);
-                            app.exportCtx.audioFramesWritten += toWriteTotal;
-                            if (residue.size() > 44100 * 2) residue.clear();
                         }
+                        if (residue.size() > 88200 * 2) residue.clear();
                     }
                 }
             } else if (app.exportCtx.isClosing && app.recordQ.size() == 0) {
@@ -189,6 +192,7 @@ int main(int, char**) {
     SDL_Event evt;
     auto lastPoll = std::chrono::steady_clock::now();
     double wallTimeAccum = 0.0;
+    auto lastRecordTick = std::chrono::steady_clock::now();
 
     while (running) {
         {
@@ -204,155 +208,126 @@ int main(int, char**) {
             EngineParams active = app.baseParams;
 
             float tracking_deg = std::clamp(app.videoParams.tracking_error, 0.0f, 1.0f);
-                float dropout_deg = std::clamp(app.baseParams.dropout_rate * 10.0f, 0.0f, 1.0f);
-                float motor_deg = std::clamp(app.baseParams.motor_health, 0.0f, 1.0f);
-                float crease_deg = std::clamp(app.videoParams.tape_crease, 0.0f, 1.0f);
-                float metal_deg = std::clamp(app.baseParams.tape_metal_loss, 0.0f, 1.0f);
-                float binder_deg = std::clamp(app.baseParams.tape_binder_decay, 0.0f, 1.0f);
-                float head_wear_deg = std::clamp(app.baseParams.tape_head_wear, 0.0f, 1.0f);
+            float dropout_deg = std::clamp(app.videoParams.dropout_rate * 10.0f, 0.0f, 1.0f);
+            float motor_deg = std::clamp(app.videoParams.motor_health, 0.0f, 1.0f);
+            float crease_deg = std::clamp(app.videoParams.tape_crease, 0.0f, 1.0f);
+            float metal_deg = std::clamp(app.baseParams.tape_metal_loss, 0.0f, 1.0f);
+            float binder_deg = std::clamp(app.baseParams.tape_binder_decay, 0.0f, 1.0f);
+            float head_wear_deg = std::clamp(app.baseParams.tape_head_wear, 0.0f, 1.0f);
 
-                float rf_level = 1.0f - tracking_deg * 0.7f
-                                        - dropout_deg * 0.3f
-                                        - metal_deg * 0.55f
-                                        - crease_deg * 0.5f;
+            float signal_loss = std::clamp(
+                tracking_deg * 0.6f + dropout_deg * 0.3f + metal_deg * 0.45f + 
+                crease_deg * 0.5f + binder_deg * 0.3f + head_wear_deg * 0.25f, 0.0f, 1.0f);
 
-                float chroma_atten = 1.0f - tracking_deg * 0.6f
-                                         - motor_deg * 0.3f
-                                         - head_wear_deg * 0.55f;
+            static float hifi_blend_lpf = 0.0f;
+            hifi_blend_lpf += (signal_loss - hifi_blend_lpf) * 0.04f;
+            float hifi_blend = hifi_blend_lpf;
 
-                float luma_noise = tracking_deg * 0.5f
-                                 + dropout_deg * 0.3f
-                                 + metal_deg * 0.45f
-                                 + binder_deg * 0.25f;
+            if (hifi_blend > 0.05f) {
+                float buzz_t = (float)g_audioSamplePos.load() / AUDIO_SR;
+                float buzz_env = hifi_blend * (1.0f - hifi_blend) * 4.0f;
+                active.print_through += buzz_env * 0.15f;
+                active.hiss += buzz_env * 0.006f;
+                float buzz_phase = std::fmod(buzz_t * 60.0f, 1.0f);
+                if (buzz_phase > 0.85f)
+                    active.dropout_rate = std::min(active.dropout_rate + buzz_env * 0.015f, 0.09f);
+            }
 
-                float chroma_noise = tracking_deg * 0.6f
-                                   + motor_deg * 0.4f
-                                   + head_wear_deg * 0.50f;
+            if (hifi_blend > 0.1f) {
+                float t = std::clamp((hifi_blend - 0.1f) / 0.9f, 0.0f, 1.0f);
+                active.azimuth_drift = std::max(active.azimuth_drift, t);
+                float linear_cutoff = 8000.0f - t * 3000.0f;
+                active.cutoff_base = std::min(active.cutoff_base, linear_cutoff);
+                active.hiss += t * 0.010f;
+            }
 
-                float dropout_intensity = dropout_deg * 0.8f
-                                       + metal_deg * 0.6f
-                                       + tracking_deg * 0.4f;
+            if (tracking_deg > 0.05f) {
+                active.hiss += tracking_deg * 0.015f;
+                active.cutoff_base *= std::max(0.02f, 1.0f - tracking_deg * 0.95f);
+                active.azimuth_drift += tracking_deg;
+                active.dropout_rate = std::min(active.dropout_rate + tracking_deg * 0.05f, 0.09f);
+            }
 
-                float signal_loss = tracking_deg * 0.6f
-                                + dropout_deg * 0.3f
-                                + metal_deg * 0.45f
-                                + crease_deg * 0.5f
-                                + binder_deg * 0.3f;
-
-                static float signal_lpf = 1.0f;
-                signal_lpf += (1.0f - signal_loss - signal_lpf) * 0.1f;
-                float signal_strength = std::max(0.05f, signal_lpf);
-
-                static float hifi_blend_lpf = 0.0f;
-                hifi_blend_lpf += (signal_loss - hifi_blend_lpf) * 0.04f;
-                float hifi_blend = hifi_blend_lpf;
-
-                if (hifi_blend > 0.05f) {
-                    float buzz_t = (float)g_audioSamplePos.load() / AUDIO_SR;
-                    float buzz_env = hifi_blend * (1.0f - hifi_blend) * 4.0f;
-                    active.print_through += buzz_env * 0.15f;
-                    active.hiss += buzz_env * 0.006f;
-                    float buzz_phase = std::fmod(buzz_t * 60.0f, 1.0f);
-                    if (buzz_phase > 0.85f)
-                        active.dropout_rate = std::min(active.dropout_rate + buzz_env * 0.015f, 0.09f);
+            if (crease_deg > 0.01f) {
+                float t_sec = (float)g_audioSamplePos.load() / AUDIO_SR;
+                float cp = std::fmod(t_sec * 0.1f, 1.0f);
+                if (cp > 0.4f && cp < 0.6f) {
+                    active.dropout_rate += crease_deg * 0.5f;
+                    active.flutter_dep += crease_deg * 2.0f;
                 }
+            }
 
-                if (hifi_blend > 0.1f) {
-                    float t = std::clamp((hifi_blend - 0.1f) / 0.9f, 0.0f, 1.0f);
-                    active.azimuth_drift = std::max(active.azimuth_drift, t);
-                    float linear_cutoff = 8000.0f - t * 3000.0f;
-                    active.cutoff_base = std::min(active.cutoff_base, linear_cutoff);
-                    active.hiss += t * 0.010f;
-                }
+            if (motor_deg > 0.05f) {
+                active.wow_dep += motor_deg * 3.0f;
+                active.flutter_dep += motor_deg * 0.5f;
+                active.dropout_rate += motor_deg * 0.03f;
+            }
 
-                if (tracking_deg > 0.05f) {
-                    active.hiss += tracking_deg * 0.015f;
-                    active.cutoff_base *= std::max(0.02f, 1.0f - tracking_deg * 0.95f);
-                    active.azimuth_drift += tracking_deg;
-                    active.dropout_rate = std::min(active.dropout_rate + tracking_deg * 0.05f, 0.09f);
-                }
+            if (binder_deg > 0.01f) {
+                active.cutoff_base *= std::max(0.1f, 1.0f - binder_deg * 0.7f);
+                active.hiss += binder_deg * 0.008f;
+            }
 
-                if (crease_deg > 0.01f) {
-                    float t_sec = (float)g_audioSamplePos.load() / AUDIO_SR;
-                    float cp = std::fmod(t_sec * 0.1f, 1.0f);
-                    if (cp > 0.4f && cp < 0.6f) {
-                        active.dropout_rate += crease_deg * 0.5f;
-                        active.flutter_dep += crease_deg * 2.0f;
-                    }
-                }
+            if (head_wear_deg > 0.01f) {
+                active.print_through += head_wear_deg * 0.3f;
+                active.hiss += head_wear_deg * 0.005f;
+            }
 
-                if (motor_deg > 0.05f) {
-                    active.wow_dep += motor_deg * 3.0f;
-                    active.flutter_dep += motor_deg * 0.5f;
-                    active.dropout_rate += motor_deg * 0.03f;
-                }
+            float spd = 1.f;
+            float instantSpd = 1.f;
+            
+            if (engineRunning) {
+                std::lock_guard<std::mutex> lk(app.tapeEngine->lock);
+                float inertia_ramp = app.audioIO->current_speed_mult();
+                spd = inertia_ramp;
+                float m_eng = app.tapeEngine->params.motor_engage;
+                bool  m_rev = app.tapeEngine->params.is_reversed;
+                app.tapeEngine->params = active;
+                app.tapeEngine->params.tape_speed_mult = spd;
+                app.tapeEngine->params.motor_engage    = m_eng;
+                app.tapeEngine->params.is_reversed     = m_rev;
+                spd = std::clamp(spd, .01f, 4.f);
+                g_audioSamplePos.store(int64_t(app.tapeEngine->play_head));
+                int64_t total = app.tapeEngine->total_samples;
+                if (total > 0 && g_audioSamplePos.load() > total) g_audioSamplePos.store(0);
+                instantSpd = app.tapeEngine->transport.last_instant_speed;
+            }
+            
+            {
+                std::lock_guard<std::mutex> lk(app.pp.mu);
+                app.pp.epSnap = active;
+                app.pp.vpSnap = app.videoParams;
+                app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
+                app.pp.ntscEnabled = app.ntscEnabled;
+                app.pp.tapeSpd = spd;
+                app.pp.instantSpd = instantSpd;
+                app.pp.recording_id = app.currentRecordingId.load();
+                app.pp.engValid.store(engineRunning);
+                if (engineRunning) app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
+            }
+        }
 
-                if (binder_deg > 0.01f) {
-                    active.cutoff_base *= std::max(0.1f, 1.0f - binder_deg * 0.7f);
-                    active.hiss += binder_deg * 0.008f;
-                }
-
-                if (head_wear_deg > 0.01f) {
-                    active.print_through += head_wear_deg * 0.3f;
-                    active.hiss += head_wear_deg * 0.005f;
-                }
-
-                float spd = 1.f;
-                float instantSpd = 1.f;
-                
-                if (engineRunning) {
-                    std::lock_guard<std::mutex> lk(app.tapeEngine->lock);
-                    float inertia_ramp = app.audioIO->current_speed_mult();
-                    spd = inertia_ramp;
-
-                    float m_eng = app.tapeEngine->params.motor_engage;
-                    bool  m_rev = app.tapeEngine->params.is_reversed;
-                    app.tapeEngine->params = active;
-                    app.tapeEngine->params.tape_speed_mult = spd;
-                    app.tapeEngine->params.motor_engage    = m_eng;
-                    app.tapeEngine->params.is_reversed     = m_rev;
-
-                    spd = std::clamp(spd, .01f, 4.f);
-                    
-                    g_audioSamplePos.store(int64_t(app.tapeEngine->play_head));
-                    int64_t total = app.tapeEngine->total_samples;
-                    if (total > 0 && g_audioSamplePos.load() > total) g_audioSamplePos.store(0);
-                    
-                    instantSpd = app.tapeEngine->transport.last_instant_speed;
-                }
-                
+        // --- PREVIEW RECORDER (60Hz Wall-clock) ---
+        if (app.exportCtx.active && !app.exportCtx.isClosing) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - lastRecordTick).count();
+            double frameTime = 1.0 / 60.0;
+            while (elapsed >= frameTime) {
+                lastRecordTick += std::chrono::nanoseconds((long long)(frameTime * 1e9));
+                elapsed -= frameTime;
+                cv::Mat f;
                 {
-                    std::lock_guard<std::mutex> lk(app.pp.mu);
-                    app.pp.epSnap = active;
-                    app.pp.vpSnap = app.videoParams;
-                    app.pp.vpSnap.signal_strength = signal_strength;
-                    app.pp.vpSnap.base_rf_level = rf_level;
-                    app.pp.vpSnap.chroma_level = chroma_atten;
-                    app.pp.vpSnap.luma_noise = luma_noise;
-                    app.pp.vpSnap.chroma_noise = chroma_noise;
-                    app.pp.vpSnap.dropout_intensity = dropout_intensity;
-                    app.pp.vpSnap.dropout_rate = app.baseParams.dropout_rate;
-                    app.pp.vpSnap.motor_health = app.baseParams.motor_health;
-                    app.pp.vpSnap.tape_metal_loss = app.baseParams.tape_metal_loss;
-                    app.pp.vpSnap.tape_binder_decay = app.baseParams.tape_binder_decay;
-                    app.pp.vpSnap.tape_head_wear = app.baseParams.tape_head_wear;
-                    app.pp.av_sync_offset_ms = app.av_sync_offset_ms;
-                    app.pp.ntscEnabled = app.ntscEnabled;
-                    app.pp.tapeSpd = spd;
-                    app.pp.instantSpd = instantSpd;
-                    app.pp.recording_id = app.currentRecordingId.load();
-                    app.pp.engValid.store(engineRunning);
-                    if (engineRunning) app.pp.exPtr->tapeEnginePtr = app.tapeEngine.get();
+                    std::lock_guard<std::mutex> lk(app.frameMu);
+                    if (!app.lastOut.empty()) f = app.lastOut.clone();
                 }
+                if (!f.empty()) app.recordQ.push(f);
+            }
+        } else {
+            lastRecordTick = std::chrono::steady_clock::now();
         }
 
         if (g_videoEnded.exchange(false)) {
-            g_sourceFPS.store(kNTSC_FPS);
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(app.frameMu);
-            // DONT overwrite lastRaw!
+            g_sourceFPS.store(kNTSC_FIELD_HZ);
         }
 
         while (SDL_PollEvent(&evt)) {
@@ -375,6 +350,8 @@ int main(int, char**) {
 
     drainRun = false;
     drainThread.join();
+    recordRun = false;
+    recordThread.join();
     app.pipeline.stop();
     app.capture.stop();
     if (app.audioIO) {

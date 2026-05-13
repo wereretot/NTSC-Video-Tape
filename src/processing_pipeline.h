@@ -15,11 +15,11 @@ struct TapeEngine;
 enum class ExportFormat { H264_MP4, FFV1_MKV, FFV1_AVI };
 
 struct ExportContext {
-    bool              active = false;
+    std::atomic<bool> active{false};
     ExportFormat      format = ExportFormat::H264_MP4;
     std::string       path;
     cv::VideoWriter   writer;
-    int               frameCount = 0;
+    std::atomic<int>  frameCount{0};
     std::string       tempVideoPath;
     std::string       tempAudioPath;
     std::mutex        writerMu;

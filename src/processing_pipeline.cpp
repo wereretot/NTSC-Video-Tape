@@ -4,7 +4,7 @@
 #include <chrono>
 
 std::atomic<int64_t> g_audioSamplePos{0};
-std::atomic<float>   g_sourceFPS{kNTSC_FPS};
+std::atomic<float>   g_sourceFPS{kNTSC_FIELD_HZ};
 std::atomic<bool>    g_videoReset{false};
 std::atomic<bool>    g_pipelineFlush{false};
 std::atomic<bool>    g_videoEnded{false};

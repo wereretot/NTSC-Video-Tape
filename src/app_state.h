@@ -24,8 +24,8 @@ struct AppState {
     std::unique_ptr<AudioIO>    audioIO;
     std::string        audioWavPath;
     ExportContext      exportCtx;
-    FrameQueue<std::vector<float>> audioCaptureQ;
-    FrameQueue<cv::Mat> recordQ;
+    FrameQueue<std::vector<float>> audioCaptureQ{1024};
+    FrameQueue<cv::Mat>            recordQ{300};
 
     int   selectedFx = 0, tapeSpeedIdx = 0;
     bool  ntscEnabled = true;

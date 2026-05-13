@@ -489,12 +489,14 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
 
             {
                 std::lock_guard<std::mutex> wlk(app.exportCtx.writerMu);
-                if (app.exportCtx.writer.open(app.exportCtx.tempVideoPath, fourcc, kNTSC_FPS, {FW, FH})) {
+                if (app.exportCtx.writer.open(app.exportCtx.tempVideoPath, fourcc, 60.0, {FW, FH})) {
                     app.exportCtx.active = true;
                 }
             }
 
             if (app.exportCtx.active) {
+                app.recordQ.clear();
+                app.audioCaptureQ.clear();
                 app.exportCtx.frameCount = 0;
                 startGlobalAudioCapture(app, app.exportCtx.tempAudioPath);
                 SDL_Log("Export: Started recording intermediate to %s", app.exportCtx.tempVideoPath.c_str());
@@ -539,7 +541,7 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
             }
 
             SDL_Log("Export: Capture summary - Video frames: %d, Audio: %ld bytes",
-                app.exportCtx.frameCount, audioSz);
+                app.exportCtx.frameCount.load(), audioSz);
 
             if (hasAudio) {
                 const char* aCodec = (app.exportCtx.format == ExportFormat::H264_MP4) ? "aac" : "copy";
@@ -574,10 +576,10 @@ void drawUI(AppState& app, SDL_Renderer* ren) {
         int64_t vf = sf > 0 ? int64_t(double(ap) / (AUDIO_SR / sf)) : 0;
         ImGui::Text("AUDIO POS: %8lld smp", (long long)ap);
         ImGui::Text("VIDEO FRM: %8lld", (long long)vf);
-        ImGui::Text("SRC FPS:   %6.2f  (NTSC %.2f)", (double)sf, kNTSC_FPS);
+        ImGui::Text("SRC FPS:   %6.2f  (NTSC %.2f)", (double)sf, kNTSC_FIELD_HZ);
         ImGui::Text("PROC FPS:  %6.1f", (double)app.pipeline.fps());
         ImGui::Text("H-SYNC:    %.2f Hz", kNTSC_HSYNC);
-        ImGui::Text("V-SYNC:    %.2f Hz", kNTSC_FPS * 2.f);
+        ImGui::Text("V-SYNC:    %.2f Hz", kNTSC_FIELD_HZ);
         bool locked = false;
         {
             std::lock_guard<std::mutex> a_lk(app.audioMu);

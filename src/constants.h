@@ -12,6 +12,7 @@ static constexpr int   AUDIO_SR      = 44100;
 static const     float kPI           = 3.14159265f;
 static constexpr float kSC_PX        = 2.f * 3.14159265f * 227.5f / float(FW);
 static constexpr float kNTSC_FPS     = 29.97f;
+static constexpr float kNTSC_FIELD_HZ = kNTSC_FPS * 2.f;
 static constexpr float kNTSC_FRAME_S = 1.f / kNTSC_FPS;
 static constexpr float kNTSC_HSYNC   = 15734.26f;
 static constexpr int   kNTSC_TOTAL_LINES = 525;
